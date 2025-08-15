@@ -92,6 +92,10 @@ async def goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"👋 Goodbye {update.message.left_chat_member.full_name}!")
         await log_activity(f"User left: {update.message.left_chat_member.full_name}")
 
+# Load spam keywords from environment variable (comma-separated)
+SPAM_KEYWORDS = os.getenv("SPAM_KEYWORDS", "")
+SPAM_KEYWORDS = [word.strip().lower() for word in SPAM_KEYWORDS.split(",") if word.strip()]
+
 async def detect_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text and any(word in update.message.text.lower() for word in SPAM_KEYWORDS):
         user_name = update.message.from_user.first_name
