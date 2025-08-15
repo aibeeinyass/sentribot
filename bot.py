@@ -94,8 +94,11 @@ async def goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def detect_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text and update.message.text.lower() in ["buy now", "click here", "free money"]:
-        await update.message.chat.delete_message(update.message.message_id)
+        # Delete the spam message
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=update.message.message_id)
+        # Notify group
         await update.message.reply_text(f"🚫 Spam detected from {update.message.from_user.first_name}")
+        # Warn the user
         await warn_user(update, context)
 
 # -------- LOGGING --------
