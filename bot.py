@@ -3,6 +3,8 @@ from telegram import Update, ChatPermissions
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from datetime import datetime
 
+from buy_tracker import register_buytracker   # <-- NEW
+
 TOKEN = os.getenv("BOT_TOKEN")
 
 # -------- SETTINGS --------
@@ -23,7 +25,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/about - About the bot\n"
         "/setwelcome <message> - Change welcome text\n"
         "/warn - Warn a user (reply to a message)\n"
-        "/pin - Pin the latest message"
+        "/pin - Pin the latest message\n"
+        "/track <mint> - Track token buys\n"
+        "/untrack <mint> - Stop tracking a token\n"
+        "/list - List tracked tokens\n"
+        "/skip <txsig> - Ignore a specific transaction"
     )
 
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -133,6 +139,9 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, goodbye))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, detect_spam))
+
+    # -------- BUY TRACKER INTEGRATION --------
+    register_buytracker(app)   # <-- plug in all /track, /untrack, /list etc.
 
     app.run_polling()
 
