@@ -127,6 +127,9 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------- EXTERNAL APIS ----------------
 HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 BIRDEYE_TOKEN_URL = "https://public-api.birdeye.so/defi/token/{}"
+DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
+COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/solana/contract/{}"
+PUMPFUN_URL = "https://api.pump.fun/v1/token/{}"  # placeholder
 
 async def fetch_transactions(mint: str, limit: int = 5):
     payload = {
@@ -148,8 +151,8 @@ async def get_transaction(signature: str):
         "params": [signature, {"encoding": "jsonParsed"}],
     }
     async with aiohttp.ClientSession() as session:
-        async with session.post(HELIUS_URL, json=payload) as resp:
-            return (await resp.json()).get("result")
+        resp = await session.post(HELIUS_URL, json=payload)
+        return await resp.json().get("result")
 
 async def parse_buy(signature: str, mint: str):
     tx = await get_transaction(signature)
@@ -181,18 +184,59 @@ async def parse_buy(signature: str, mint: str):
             return {"buyer": b.get("owner"), "amount": tokens, "decimals": dec}
     return None
 
+# ---------------- FETCH TOKEN INFO ----------------
 async def fetch_token_info(mint: str):
-    if not BIRDEYE_API_KEY:
-        return {}
-    headers = {"x-api-key": BIRDEYE_API_KEY}
-    url = BIRDEYE_TOKEN_URL.format(mint)
-    async with aiohttp.ClientSession(headers=headers) as session:
-        async with session.get(url) as resp:
-            data = await resp.json()
-            if data.get("success"):
-                return data.get("data", {})
-    return {}
+    # 1. Pump.fun
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(PUMPFUN_URL.format(mint)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    d = data.get("data", {})
+                    if d:
+                        return {
+                            "symbol": d.get("symbol", "TOKEN"),
+                            "price": float(d.get("price", 0)),
+                            "mc": float(d.get("marketCap", 0))
+                        }
+    except Exception:
+        pass
 
+    # 2. DexScreener
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(DEXSCREENER_URL.format(mint)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs", [])
+                    if pairs:
+                        pair = pairs[0]
+                        return {
+                            "symbol": pair.get("baseToken", {}).get("symbol", "TOKEN"),
+                            "price": float(pair.get("priceUsd", 0) or 0),
+                            "mc": float(pair.get("liquidityUsd", 0) or 0)
+                        }
+    except Exception:
+        pass
+
+    # 3. Coingecko
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(COINGECKO_URL.format(mint)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    market_data = data.get("market_data", {})
+                    return {
+                        "symbol": data.get("symbol", "TOKEN").upper(),
+                        "price": float(market_data.get("current_price", {}).get("usd", 0)),
+                        "mc": float(market_data.get("market_cap", {}).get("usd", 0))
+                    }
+    except Exception:
+        pass
+
+    return {"symbol": "TOKEN", "price": 0, "mc": 0}
+
+# ---------------- POLLING ----------------
 async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -202,7 +246,7 @@ async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
 
     for chat_id, mint, media_file_id in rows:
         try:
-            txs = await fetch_transactions(mint, limit=5)
+            txs = await fetch_transactions(mint, limit=
             if not txs:
                 continue
             sig = txs[0]["signature"]
@@ -249,7 +293,6 @@ async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"Error polling {mint}: {e}")
 
-# ---------------- REGISTRATION FUNCTION ----------------
 def register_buytracker(app):
     init_db()
     app.add_handler(CommandHandler("track", cmd_track))
@@ -258,3 +301,4 @@ def register_buytracker(app):
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_media))
     app.job_queue.run_repeating(poll_tracked, interval=30, first=5)
+
