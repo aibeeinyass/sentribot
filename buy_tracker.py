@@ -151,8 +151,9 @@ async def get_transaction(signature: str):
         "params": [signature, {"encoding": "jsonParsed"}],
     }
     async with aiohttp.ClientSession() as session:
-        resp = await session.post(HELIUS_URL, json=payload)
-        return await resp.json().get("result")
+        async with session.post(HELIUS_URL, json=payload) as resp:
+            data = await resp.json()
+            return data.get("result")
 
 async def parse_buy(signature: str, mint: str):
     tx = await get_transaction(signature)
@@ -301,4 +302,3 @@ def register_buytracker(app):
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_media))
     app.job_queue.run_repeating(poll_tracked, interval=30, first=5)
-
