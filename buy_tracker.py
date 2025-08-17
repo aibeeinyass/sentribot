@@ -246,7 +246,7 @@ async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
 
     for chat_id, mint, media_file_id in rows:
         try:
-            txs = await fetch_transactions(mint, limit=
+            txs = await fetch_transactions(mint, limit=5)
             if not txs:
                 continue
             sig = txs[0]["signature"]
