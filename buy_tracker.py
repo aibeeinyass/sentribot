@@ -187,7 +187,7 @@ async def parse_buy(signature: str, mint: str):
 
 # ---------------- FETCH TOKEN INFO ----------------
 async def fetch_token_info(mint: str):
-    # 1. Pump.fun
+    # Pump.fun
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(PUMPFUN_URL.format(mint)) as resp:
@@ -203,7 +203,7 @@ async def fetch_token_info(mint: str):
     except Exception:
         pass
 
-    # 2. DexScreener
+    # DexScreener
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(DEXSCREENER_URL.format(mint)) as resp:
@@ -220,7 +220,7 @@ async def fetch_token_info(mint: str):
     except Exception:
         pass
 
-    # 3. Coingecko
+    # Coingecko
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(COINGECKO_URL.format(mint)) as resp:
@@ -261,30 +261,24 @@ async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
             mcap = float(token_info.get("mc", 0) or 0)
 
             details = await parse_buy(sig, mint)
-            if details:
-                amount = float(details.get("amount", 0))
-                buyer = details.get("buyer")
-                usd_value = amount * price if price else 0
-                text = (
-                    f"🔥 Buy Detected!\n\n"
-                    f"Token: {symbol}\n"
-                    f"Mint: {mint}\n"
-                    f"Amount Bought: {fmt_num(amount)}\n"
-                    f"Value: ${fmt_num(usd_value)}\n"
-                    f"Price: ${fmt_price(price)}\n"
-                    f"Market Cap: ${fmt_num(mcap)}\n"
-                    f"Buyer: {short_wallet(buyer)}\n"
-                    f"Tx: https://solscan.io/tx/{sig}"
-                )
-            else:
-                text = (
-                    f"🔥 Buy Detected!\n\n"
-                    f"Token: {symbol}\n"
-                    f"Mint: {mint}\n"
-                    f"Price: ${fmt_price(price)}\n"
-                    f"Market Cap: ${fmt_num(mcap)}\n"
-                    f"Tx: https://solscan.io/tx/{sig}"
-                )
+            if not details:
+                continue  # skip if no buy detected
+
+            amount = float(details.get("amount", 0))
+            buyer = details.get("buyer")
+            usd_value = amount * price if price else 0
+
+            text = (
+                f"🔥 Buy Detected!\n\n"
+                f"Token: {symbol}\n"
+                f"Mint: {mint}\n"
+                f"Amount Bought: {fmt_num(amount)}\n"
+                f"Value: ${fmt_num(usd_value)}\n"
+                f"Price: ${fmt_price(price)}\n"
+                f"Market Cap: ${fmt_num(mcap)}\n"
+                f"Buyer: {short_wallet(buyer)}\n"
+                f"Tx: https://solscan.io/tx/{sig}"
+            )
 
             if media_file_id:
                 await context.bot.send_photo(chat_id, photo=media_file_id, caption=text)
