@@ -3,24 +3,14 @@ import sqlite3
 import logging
 import aiohttp
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CommandHandler, MessageHandler, ContextTypes, filters
 
 # ---------------- SETTINGS ----------------
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
+
 DB_PATH = "tracked_tokens.db"
 logging.basicConfig(level=logging.INFO)
-
-# Native SOL placeholder (not a real SPL mint)
-NATIVE_SOL_MINTS = {"So11111111111111111111111111111111111111112"}
-def is_native_sol(mint: str) -> bool:
-    return mint in NATIVE_SOL_MINTS
-
-# ---------------- EXTERNAL APIS ----------------
-HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
-COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/solana/contract/{}"
-PUMPFUN_URL = "https://api.pump.fun/v1/token/{}"  # best-effort; may not always be available
 
 # ---------------- DATABASE ----------------
 def init_db():
@@ -31,31 +21,16 @@ def init_db():
             chat_id INTEGER,
             mint TEXT,
             media_file_id TEXT,
-            symbol TEXT,
             PRIMARY KEY (chat_id, mint)
         )
     """)
-    # Safeguard migration if table existed without 'symbol'
-    cols = {row[1] for row in c.execute("PRAGMA table_info(tracked_tokens)").fetchall()}
-    if "symbol" not in cols:
-        c.execute("ALTER TABLE tracked_tokens ADD COLUMN symbol TEXT")
     conn.commit()
     conn.close()
 
-def add_token(chat_id, mint, media_file_id=None, symbol=None):
+def add_token(chat_id, mint, media_file_id=None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute(
-        "INSERT OR REPLACE INTO tracked_tokens (chat_id, mint, media_file_id, symbol) VALUES (?, ?, ?, ?)",
-        (chat_id, mint, media_file_id, symbol),
-    )
-    conn.commit()
-    conn.close()
-
-def update_symbol(mint: str, symbol: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE tracked_tokens SET symbol=? WHERE mint=?", (symbol, mint))
+    c.execute("INSERT OR REPLACE INTO tracked_tokens VALUES (?, ?, ?)", (chat_id, mint, media_file_id))
     conn.commit()
     conn.close()
 
@@ -66,10 +41,10 @@ def remove_token(chat_id, mint):
     conn.commit()
     conn.close()
 
-def list_tokens_rows(chat_id):
+def list_tokens(chat_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT mint, media_file_id, symbol FROM tracked_tokens WHERE chat_id=?", (chat_id,))
+    c.execute("SELECT mint, media_file_id FROM tracked_tokens WHERE chat_id=?", (chat_id,))
     rows = c.fetchall()
     conn.close()
     return rows
@@ -78,6 +53,9 @@ def list_tokens_rows(chat_id):
 def fmt_num(x):
     try:
         n = float(x or 0)
+        # show 2 decimals for small money amounts, otherwise no decimals
+        if n < 1000:
+            return f"{n:,.2f}"
         return f"{n:,.0f}"
     except Exception:
         return str(x)
@@ -89,32 +67,14 @@ def fmt_price(x):
     except Exception:
         return str(x)
 
-def fmt_amount(x):
-    try:
-        n = float(x or 0)
-        if n == 0:
-            return "0"
-        if n < 1:
-            return f"{n:.6f}".rstrip("0").rstrip(".")
-        if n < 1000:
-            return f"{n:.4f}".rstrip("0").rstrip(".")
-        return f"{n:,.2f}"
-    except Exception:
-        return str(x)
-
 def short_wallet(addr: str) -> str:
     if not addr or len(addr) < 8:
         return addr or "?"
     return addr[:4] + "..." + addr[-4:]
 
-def short_mint(mint: str) -> str:
-    if not mint or len(mint) <= 10:
-        return mint or "?"
-    return mint[:4] + "…" + mint[-4:]
-
 # ---------------- BUYTRACKER LOGIC ----------------
 pending_media = {}
-last_seen = {}  # mint -> last seen tx signature
+last_seen = {}
 
 async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -122,21 +82,9 @@ async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     mint = context.args[0].strip()
     chat_id = update.effective_chat.id
-
-    if is_native_sol(mint):
-        await update.message.reply_text(
-            "⚠️ Native SOL isn’t an SPL mint. This tracker watches SPL token mints (e.g., pump.fun tokens). "
-            "Please /track a token mint address instead."
-        )
-        return
-
-    # Try to grab a symbol immediately (non-blocking if it fails)
-    symbol = await best_symbol_for_mint(mint)
     pending_media[chat_id] = mint
-    add_token(chat_id, mint, None, symbol)
-    await update.message.reply_text(
-        f"✅ Tracking {mint} ({symbol or 'TOKEN'}). Send an image now or /skip."
-    )
+    add_token(chat_id, mint, None)
+    await update.message.reply_text(f"✅ Tracking {mint}. Send an image now or /skip.")
 
 async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -157,8 +105,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id = update.message.document.file_id
     else:
         return
-    # keep existing symbol if present
-    add_token(chat_id, mint, file_id, None)
+    add_token(chat_id, mint, file_id)
     await update.message.reply_text(f"📸 Media saved for {mint}.")
 
 async def cmd_untrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -172,32 +119,32 @@ async def cmd_untrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    rows = list_tokens_rows(chat_id)
-    if not rows:
+    tokens = list_tokens(chat_id)
+    if not tokens:
         await update.message.reply_text("No tokens tracked.")
-        return
+    else:
+        # Prettier list: show a bullet with symbol [short_mint]
+        # We’ll fetch names/symbols quickly (best-effort, not blocking hard)
+        lines = []
+        for mint, _ in tokens:
+            sym, name = mint[-4:], None
+            try:
+                info = await quick_token_identity(mint)
+                sym = info.get("symbol") or sym
+                name = info.get("name")
+            except Exception:
+                pass
+            short_mint = mint[:4] + "..." + mint[-4:]
+            label = f"{(name or sym)} [{sym}] — `{short_mint}`"
+            lines.append(f"• {label}")
+        await update.message.reply_text("📋 Tracked tokens:\n" + "\n".join(lines), parse_mode=None)
 
-    # Ensure each has a symbol; if missing, fetch and update
-    enriched = []
-    for mint, _media, symbol in rows:
-        if not symbol:
-            symbol = await best_symbol_for_mint(mint)
-            if symbol:
-                update_symbol(mint, symbol)
-        enriched.append((symbol or "TOKEN", mint))
+# ---------------- EXTERNAL APIS ----------------
+HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
+COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/solana/contract/{}"
+PUMPFUN_URL = "https://api.pump.fun/v1/token/{}"  # placeholder
 
-    # Sort by symbol
-    enriched.sort(key=lambda t: t[0].upper())
-
-    # Build pretty list with links
-    lines = []
-    for symbol, mint in enriched:
-        link = f"https://solscan.io/token/{mint}"
-        lines.append(f"• {symbol} — [{short_mint(mint)}]({link})")
-
-    await update.message.reply_text("📋 Tracked tokens:\n" + "\n".join(lines), disable_web_page_preview=True, parse_mode="Markdown")
-
-# ---------------- CORE RPC ----------------
 async def fetch_transactions(mint: str, limit: int = 5):
     payload = {
         "jsonrpc": "2.0",
@@ -222,7 +169,6 @@ async def get_transaction(signature: str):
             data = await resp.json()
             return data.get("result")
 
-# ---------------- BUY PARSER ----------------
 async def parse_buy(signature: str, mint: str):
     tx = await get_transaction(signature)
     if not tx:
@@ -253,25 +199,40 @@ async def parse_buy(signature: str, mint: str):
             return {"buyer": b.get("owner"), "amount": tokens, "decimals": dec}
     return None
 
-# ---------------- TOKEN INFO + SYMBOL HELPERS ----------------
+# -------- quick identity for /list (best-effort, fast) --------
+async def quick_token_identity(mint: str):
+    # Try DexScreener only (fast and free). Return {symbol, name} minimal.
+    async with aiohttp.ClientSession() as session:
+        async with session.get(DEXSCREENER_URL.format(mint)) as resp:
+            if resp.status != 200:
+                return {}
+            data = await resp.json()
+            pairs = data.get("pairs", []) or []
+            if not pairs:
+                return {}
+            bt = pairs[0].get("baseToken", {}) or {}
+            return {"symbol": bt.get("symbol"), "name": bt.get("name")}
+
+# ---------------- FETCH TOKEN INFO ----------------
 async def fetch_token_info(mint: str):
-    # 1) Pump.fun (best effort)
+    # 1) Pump.fun (pre-liquidity tokens)
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(PUMPFUN_URL.format(mint)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    d = data.get("data") or {}
+                    d = data.get("data", {}) or {}
                     if d:
                         return {
                             "symbol": d.get("symbol", "TOKEN"),
+                            "name": d.get("name") or d.get("symbol") or "TOKEN",
                             "price": float(d.get("price", 0) or 0),
-                            "mc": float(d.get("marketCap", 0) or 0),
+                            "mc": float(d.get("marketCap", 0) or 0)
                         }
     except Exception:
         pass
 
-    # 2) DexScreener
+    # 2) DexScreener (liquidity/live pairs)
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(DEXSCREENER_URL.format(mint)) as resp:
@@ -280,104 +241,115 @@ async def fetch_token_info(mint: str):
                     pairs = data.get("pairs", []) or []
                     if pairs:
                         pair = pairs[0]
+                        base = pair.get("baseToken", {}) or {}
                         return {
-                            "symbol": (pair.get("baseToken") or {}).get("symbol", "TOKEN"),
+                            "symbol": base.get("symbol", "TOKEN"),
+                            "name": base.get("name") or base.get("symbol") or "TOKEN",
                             "price": float(pair.get("priceUsd", 0) or 0),
-                            "mc": float(pair.get("fdv", 0) or 0),
+                            # DexScreener doesn't return MC directly; using liquidityUsd as a proxy
+                            "mc": float(pair.get("liquidityUsd", 0) or 0)
                         }
     except Exception:
         pass
 
-    # 3) CoinGecko
+    # 3) CoinGecko (established tokens)
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(COINGECKO_URL.format(mint)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    market_data = data.get("market_data") or {}
+                    market = data.get("market_data", {}) or {}
                     return {
                         "symbol": (data.get("symbol") or "TOKEN").upper(),
-                        "price": float(((market_data.get("current_price") or {}).get("usd", 0)) or 0),
-                        "mc": float(((market_data.get("market_cap") or {}).get("usd", 0)) or 0),
+                        "name": data.get("name") or data.get("symbol") or "TOKEN",
+                        "price": float((market.get("current_price", {}) or {}).get("usd", 0) or 0),
+                        "mc": float((market.get("market_cap", {}) or {}).get("usd", 0) or 0),
                     }
     except Exception:
         pass
 
-    return {"symbol": "TOKEN", "price": 0, "mc": 0}
-
-async def best_symbol_for_mint(mint: str) -> str | None:
-    """Get a symbol quickly for display & /list. Uses the same fallbacks as fetch_token_info."""
-    try:
-        info = await fetch_token_info(mint)
-        sym = (info.get("symbol") or "").strip()
-        return sym or None
-    except Exception:
-        return None
+    return {"symbol": "TOKEN", "name": "TOKEN", "price": 0.0, "mc": 0.0}
 
 # ---------------- POLLING ----------------
 async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT chat_id, mint, media_file_id, symbol FROM tracked_tokens")
+    c.execute("SELECT chat_id, mint, media_file_id FROM tracked_tokens")
     rows = c.fetchall()
     conn.close()
 
-    for chat_id, mint, media_file_id, symbol in rows:
-        # Skip native SOL
-        if is_native_sol(mint):
-            continue
-
+    for chat_id, mint, media_file_id in rows:
         try:
             txs = await fetch_transactions(mint, limit=5)
             if not txs:
                 continue
-
-            sig = txs[0]["signature"]
+            sig = txs[0].get("signature")
+            if not sig:
+                continue
             if last_seen.get(mint) == sig:
                 continue
-
-            last_seen[mint] = sig  # set early to avoid duplicates
-
-            # Ensure we have a symbol cached
-            if not symbol:
-                symbol = await best_symbol_for_mint(mint)
-                if symbol:
-                    update_symbol(mint, symbol)
+            last_seen[mint] = sig
 
             token_info = await fetch_token_info(mint)
-            disp_symbol = symbol or token_info.get("symbol", "TOKEN")
+            symbol = token_info.get("symbol", "TOKEN")
+            name = token_info.get("name") or symbol
             price = float(token_info.get("price", 0) or 0)
             mcap = float(token_info.get("mc", 0) or 0)
 
             details = await parse_buy(sig, mint)
             if not details:
-                continue
+                continue  # only alert on actual positive token deltas
 
             amount = float(details.get("amount", 0) or 0)
-            buyer = details.get("buyer") or "?"
+            buyer = details.get("buyer")
             usd_value = amount * price if price else 0.0
 
+            # ---------- Fancy message (template style) ----------
+            skulls = "💀" * 14
+            title = f"{name} [{symbol}] 💀Buy!"
+            short_buyer = short_wallet(buyer)
+
             text = (
-                "🔥 Buy Detected!\n\n"
-                f"Token: {disp_symbol}\n"
-                f"Mint: {mint}\n"
-                f"Amount Bought: {fmt_amount(amount)}\n"
-                f"Value: ${usd_value:,.2f}\n"
-                f"Price: ${fmt_price(price)}\n"
-                f"Market Cap: ${fmt_num(mcap)}\n"
-                f"Buyer: {short_wallet(buyer)}\n"
-                f"Tx: https://solscan.io/tx/{sig}"
+                f"{title}\n\n"
+                f"{skulls}\n\n"
+                f"💀| {fmt_num(usd_value)} USDC (${fmt_num(usd_value)})\n"
+                f"💀| Got: {fmt_num(amount)} {symbol}\n"
+                f"💀| Buyer | Txn\n"
+                f"💀| Position: New\n"
+                f"💀| Market Cap: ${fmt_num(mcap)}"
             )
 
+            # ---------- Buttons ----------
+            jup = f"https://jup.ag/swap/SOL-{mint}"
+            dexs = f"https://dexscreener.com/solana/{mint}"
+            twitter = f"https://x.com/sentrip_bot"
+            buyer_url = f"https://solscan.io/account/{buyer}" if buyer else None
+            tx_url = f"https://solscan.io/tx/{sig}"
+            # Placeholder for "Boost with Odin" – change to your promo/CTA link
+            boost_url = "https://t.me/"
+
+            buttons = [
+                [
+                    InlineKeyboardButton("🐴 Buy", url=jup),
+                    InlineKeyboardButton("💀 DexS", url=dexs),
+                    InlineKeyboardButton("💀 Twitter", url=twitter),
+                    InlineKeyboardButton("⚡️ Boost with Odin", url=boost_url),
+                ],
+                [
+                    InlineKeyboardButton("Buyer", url=buyer_url or tx_url),
+                    InlineKeyboardButton("Txn", url=tx_url),
+                ],
+            ]
+            markup = InlineKeyboardMarkup(buttons)
+
             if media_file_id:
-                await context.bot.send_photo(chat_id, photo=media_file_id, caption=text)
+                await context.bot.send_photo(chat_id, photo=media_file_id, caption=text, reply_markup=markup)
             else:
-                await context.bot.send_message(chat_id, text)
+                await context.bot.send_message(chat_id, text, reply_markup=markup)
 
         except Exception as e:
             logging.error(f"Error polling {mint}: {e}")
 
-# ---------------- REGISTER ----------------
 def register_buytracker(app):
     init_db()
     app.add_handler(CommandHandler("track", cmd_track))
