@@ -4,6 +4,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 from datetime import datetime
 
 from buy_tracker import register_buytracker   # <-- NEW
+from sell_tracker import register_selltracker
 
 TOKEN = os.getenv("BOT_TOKEN")
 
@@ -142,6 +143,7 @@ def main():
 
     # -------- BUY TRACKER INTEGRATION --------
     register_buytracker(app)   # <-- plug in all /track, /untrack, /list etc.
+    register_selltracker(app)
 
     app.run_polling()
 
