@@ -139,14 +139,19 @@ DEFAULT_WHALE_USD = 1000.0 # fallback threshold if none set per token
 
 # ---------- COMMANDS ----------
 async def sell_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
+    # Robust arg parsing: handles cases where context.args is empty or user adds odd spacing/newlines
+    text = (update.message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    mint = parts[1].strip() if len(parts) > 1 else None
+
+    if not mint:
         await update.message.reply_text("❌ Usage: /track_sell <mint>")
         return
-    mint = context.args[0].strip()
+
     chat_id = update.effective_chat.id
 
     if is_native_sol(mint):
-        await update.message.reply_text("⚠️ Native SOL isn't an SPL mint. Use a token mint address.")
+        await update.message.reply_text(⚠️ Native SOL isn’t an SPL mint. Use a token mint address.")
         return
 
     symbol = await best_symbol_for_mint(mint)
