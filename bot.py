@@ -21,6 +21,10 @@ welcome_message = "🎉 Welcome {name} to the group! Please read the rules."
 warn_limit = 3
 warnings = {}  # Store warnings per user
 
+# NEW: per-chat welcome storage + default
+welcome_messages = {}
+DEFAULT_WELCOME = welcome_message
+
 
 # -------- COMMAND HANDLERS --------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -36,17 +40,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/about - About the bot\n"
         "/setwelcome <message> - Change welcome text\n"
         "/warn - Warn a user (reply to a message)\n"
-        "/pin - Pin the latest message\n\n"
-        "📊 Buy Tracker:\n"
+        "/pin - Pin the latest message\n"
+        "📊 Buy Tracker Commands:\n"
         "/track <mint> - Track token buys\n"
         "/untrack <mint> - Stop tracking a token\n"
         "/list - List tracked tokens\n"
         "/skip <txsig> - Ignore a specific transaction\n\n"
-        "📉 Sell Tracker:\n"
+        "📌 Sell Tracker Commands:\n"
         "/track_sell <mint> - Start sell tracking for a mint\n"
         "/sell_skip - Skip attaching media for the last /track_sell\n"
         "/untrack_sell <mint> - Stop sell tracking\n"
-        "/list_sells - List tracked tokens (with whale thresholds)\n"
+        "/list_sells - List tracked tokens (shows per-token whale threshold)\n"
         "/sellthreshold <mint> <usd> - Set whale alert threshold (USD) for that token"
     )
 
@@ -79,7 +83,12 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global welcome_message
     if context.args:
+        # keep original global for backwards compat, but store per-chat override
         welcome_message = " ".join(context.args)
+        # normalize {Name} -> {name}
+        normalized = welcome_message.replace("{Name}", "{name}")
+        chat_id = update.effective_chat.id
+        welcome_messages[chat_id] = normalized
         await update.message.reply_text("✅ Welcome message updated!")
     else:
         await update.message.reply_text("❌ Usage: /setwelcome <message>")
@@ -109,13 +118,16 @@ async def pin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------- AUTO FEATURES (message-based) --------
 async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    message_template = welcome_messages.get(chat_id, DEFAULT_WELCOME)
+
     for member in update.message.new_chat_members:
         if member.is_bot:
             await update.message.chat.ban_member(member.id)
             await update.message.reply_text(f"🤖 Bot {member.first_name} was removed.")
             return
         await update.message.reply_text(
-            welcome_message.format(name=member.mention_html()),
+            message_template.format(name=member.mention_html()),
             parse_mode="HTML"
         )
         await log_activity(f"User joined: {member.full_name}")
@@ -151,6 +163,9 @@ async def user_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
     if joined:
+        chat_id = cmu.chat.id
+        message_template = welcome_messages.get(chat_id, DEFAULT_WELCOME)
+
         user = cmu.from_user
         if user.is_bot:
             await context.bot.ban_chat_member(cmu.chat.id, user.id)
@@ -158,7 +173,7 @@ async def user_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             await context.bot.send_message(
                 cmu.chat.id,
-                welcome_message.format(name=user.mention_html()),
+                message_template.format(name=user.mention_html()),
                 parse_mode="HTML",
             )
             await log_activity(f"User joined: {user.full_name}")
