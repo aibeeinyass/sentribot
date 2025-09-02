@@ -6,78 +6,88 @@ import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CommandHandler, MessageHandler, ContextTypes, filters
 
-# ---------------- SETTINGS ----------------
+# ---------- SETTINGS ----------
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 DB_PATH = "tracked_tokens.db"
 logging.basicConfig(level=logging.INFO)
 
-# Native SOL placeholder (not a real SPL mint)
+# Native SOL placeholder (not an SPL mint)
 NATIVE_SOL_MINTS = {"So11111111111111111111111111111111111111112"}
 def is_native_sol(mint: str) -> bool:
     return mint in NATIVE_SOL_MINTS
 
-# ---------------- EXTERNAL APIS ----------------
+# External APIs (same as buy tracker for consistency)
 HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/solana/contract/{}"
-PUMPFUN_URL = "https://api.pump.fun/v1/token/{}"  # best-effort; may not always be available
+PUMPFUN_URL = "https://api.pump.fun/v1/token/{}"  # best-effort
 
-# ---------------- DATABASE ----------------
-def init_db():
+# ---------- DB ----------
+def init_sell_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # table for sell tracking + per-token threshold
     c.execute("""
-        CREATE TABLE IF NOT EXISTS tracked_tokens (
+        CREATE TABLE IF NOT EXISTS sell_tracked (
             chat_id INTEGER,
             mint TEXT,
             media_file_id TEXT,
             symbol TEXT,
+            usd_threshold REAL,      -- per-token whale threshold (USD)
             PRIMARY KEY (chat_id, mint)
         )
     """)
-    # Migration safeguard: add 'symbol' if missing
-    cols = {row[1] for row in c.execute("PRAGMA table_info(tracked_tokens)").fetchall()}
+    # migrate: add columns if missing
+    cols = {row[1] for row in c.execute("PRAGMA table_info(sell_tracked)").fetchall()}
     if "symbol" not in cols:
-        try:
-            c.execute("ALTER TABLE tracked_tokens ADD COLUMN symbol TEXT")
-        except Exception:
-            pass
+        try: c.execute("ALTER TABLE sell_tracked ADD COLUMN symbol TEXT")
+        except Exception: pass
+    if "usd_threshold" not in cols:
+        try: c.execute("ALTER TABLE sell_tracked ADD COLUMN usd_threshold REAL")
+        except Exception: pass
     conn.commit()
     conn.close()
 
-def add_token(chat_id, mint, media_file_id=None, symbol=None):
+def sell_add_token(chat_id, mint, media_file_id=None, symbol=None, usd_threshold=None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "INSERT OR REPLACE INTO tracked_tokens (chat_id, mint, media_file_id, symbol) VALUES (?, ?, ?, ?)",
-        (chat_id, mint, media_file_id, symbol),
+        "INSERT OR REPLACE INTO sell_tracked (chat_id, mint, media_file_id, symbol, usd_threshold) VALUES (?, ?, ?, ?, COALESCE(?, usd_threshold))",
+        (chat_id, mint, media_file_id, symbol, usd_threshold),
     )
     conn.commit()
     conn.close()
 
-def update_symbol(mint: str, symbol: str):
+def sell_update_symbol(mint: str, symbol: str):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("UPDATE tracked_tokens SET symbol=? WHERE mint=?", (symbol, mint))
+    c.execute("UPDATE sell_tracked SET symbol=? WHERE mint=?", (symbol, mint))
     conn.commit()
     conn.close()
 
-def remove_token(chat_id, mint):
+def sell_update_threshold(chat_id: int, mint: str, usd_threshold: float):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("DELETE FROM tracked_tokens WHERE chat_id=? AND mint=?", (chat_id, mint))
+    c.execute("UPDATE sell_tracked SET usd_threshold=? WHERE chat_id=? AND mint=?", (usd_threshold, chat_id, mint))
     conn.commit()
     conn.close()
 
-def list_tokens_rows(chat_id):
+def sell_remove_token(chat_id, mint):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT mint, media_file_id, symbol FROM tracked_tokens WHERE chat_id=?", (chat_id,))
+    c.execute("DELETE FROM sell_tracked WHERE chat_id=? AND mint=?", (chat_id, mint))
+    conn.commit()
+    conn.close()
+
+def sell_list_rows(chat_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT mint, media_file_id, symbol, usd_threshold FROM sell_tracked WHERE chat_id=?", (chat_id,))
     rows = c.fetchall()
     conn.close()
     return rows
 
-# ---------------- HELPERS ----------------
+# ---------- HELPERS ----------
 def fmt_num(x):
     try:
         n = float(x or 0)
@@ -122,91 +132,109 @@ def short_mint(mint: str) -> str:
         return mint or "?"
     return mint[:4] + "…" + mint[-4:]
 
-# ---------------- BUYTRACKER LOGIC ----------------
-pending_media = {}
-last_seen = {}  # mint -> last seen tx signature
+# ---------- SELL TRACKER STATE ----------
+pending_sell_media = {}    # chat_id -> mint (awaiting image)
+sell_last_seen = {}        # mint -> last tx sig processed
+DEFAULT_WHALE_USD = 1000.0 # fallback threshold if none set per token
 
-async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ Usage: /track <mint>")
+# ---------- COMMANDS ----------
+async def sell_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Robust arg parsing: handles cases where context.args is empty or user adds odd spacing/newlines
+    text = (update.message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    mint = parts[1].strip() if len(parts) > 1 else None
+
+    if not mint:
+        await update.message.reply_text("❌ Usage: /track_sell <mint>")
         return
-    mint = context.args[0].strip()
+
     chat_id = update.effective_chat.id
 
     if is_native_sol(mint):
-        await update.message.reply_text(
-            "⚠️ Native SOL isn’t an SPL mint. This tracker watches SPL token mints (e.g., pump.fun tokens). "
-            "Please /track a token mint address instead."
-        )
+        await update.message.reply_text("⚠️ Native SOL isn’t an SPL mint. Use a token mint address.")
         return
 
     symbol = await best_symbol_for_mint(mint)
-    pending_media[chat_id] = mint
-    add_token(chat_id, mint, None, symbol)
-    await update.message.reply_text(
-        f"✅ Tracking {mint} ({symbol or 'TOKEN'}). Send an image now or /skip."
-    )
+    pending_sell_media[chat_id] = mint
+    sell_add_token(chat_id, mint, None, symbol, None)
+    await update.message.reply_text(f"✅ Sell-tracking {mint} ({symbol or 'TOKEN'}). Send an image now or /sell_skip.")
 
-async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sell_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if chat_id in pending_media:
-        del pending_media[chat_id]
-        await update.message.reply_text("✅ Skipped media.")
+    if chat_id in pending_sell_media:
+        del pending_sell_media[chat_id]
+        await update.message.reply_text("✅ Skipped media for sell tracker.")
     else:
-        await update.message.reply_text("❌ No pending token.")
+        await update.message.reply_text("❌ No pending token for sell tracker.")
 
-async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sell_handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if chat_id not in pending_media:
+    if chat_id not in pending_sell_media:
         return
-    mint = pending_media.pop(chat_id)
+    mint = pending_sell_media.pop(chat_id)
     if update.message.photo:
         file_id = update.message.photo[-1].file_id
     elif update.message.document:
         file_id = update.message.document.file_id
     else:
         return
-    add_token(chat_id, mint, file_id, None)  # keep symbol if already set
-    await update.message.reply_text(f"📸 Media saved for {mint}.")
+    sell_add_token(chat_id, mint, file_id, None, None)
+    await update.message.reply_text(f"📸 Media saved for sell tracker: {mint}.")
 
-async def cmd_untrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sell_untrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ Usage: /untrack <mint>")
+        await update.message.reply_text("❌ Usage: /untrack_sell <mint>")
         return
     mint = context.args[0].strip()
     chat_id = update.effective_chat.id
-    remove_token(chat_id, mint)
-    await update.message.reply_text(f"🗑 Stopped tracking {mint}.")
+    sell_remove_token(chat_id, mint)
+    await update.message.reply_text(f"🗑 Stopped sell-tracking {mint}.")
 
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sell_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    rows = list_tokens_rows(chat_id)
+    rows = sell_list_rows(chat_id)
     if not rows:
-        await update.message.reply_text("No tokens tracked.")
+        await update.message.reply_text("No tokens sell-tracked.")
         return
-
     enriched = []
-    for mint, _media, symbol in rows:
+    for mint, _media, symbol, thr in rows:
         if not symbol:
             symbol = await best_symbol_for_mint(mint)
             if symbol:
-                update_symbol(mint, symbol)
-        enriched.append((symbol or "TOKEN", mint))
+                sell_update_symbol(mint, symbol)
+        enriched.append((symbol or "TOKEN", mint, thr))
 
     enriched.sort(key=lambda t: t[0].upper())
-
     lines = []
-    for symbol, mint in enriched:
+    for symbol, mint, thr in enriched:
         link = f"https://solscan.io/token/{mint}"
-        lines.append(f"• {symbol} — [{short_mint(mint)}]({link})")
-
+        ttext = f"{fmt_usd(thr)}" if thr and thr > 0 else f"{fmt_usd(DEFAULT_WHALE_USD)}*"
+        lines.append(f"• {symbol} — [{short_mint(mint)}]({link}) — whale: {ttext}")
     await update.message.reply_text(
-        "📋 Tracked tokens:\n" + "\n".join(lines),
+        "📋 Sell-tracked tokens:\n" + "\n".join(lines) + "\n\n*default if not set",
         disable_web_page_preview=True,
         parse_mode="Markdown"
     )
 
-# ---------------- CORE RPC ----------------
+async def sell_setthreshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Set per-token whale threshold in USD for sell alerts.
+    Usage: /sellthreshold <mint> <usd>
+    """
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ Usage: /sellthreshold <mint> <usd>")
+        return
+    mint = context.args[0].strip()
+    try:
+        usd = float(context.args[1].replace(",", ""))
+    except Exception:
+        await update.message.reply_text("❌ Invalid USD amount.")
+        return
+    chat_id = update.effective_chat.id
+    sell_update_threshold(chat_id, mint, usd)
+    await update.message.reply_text(f"✅ Whale threshold for {short_mint(mint)} set to {fmt_usd(usd)}.")
+
+# ---------- RPC ----------
 async def fetch_transactions(mint: str, limit: int = 5):
     payload = {
         "jsonrpc": "2.0",
@@ -231,8 +259,12 @@ async def get_transaction(signature: str):
             data = await resp.json()
             return data.get("result")
 
-# ---------------- BUY PARSER ----------------
-async def parse_buy(signature: str, mint: str):
+# ---------- SELL PARSER ----------
+async def parse_sell(signature: str, mint: str):
+    """
+    Detect net decrease of token balance for a holder (i.e., a sell).
+    Returns {"seller": <address>, "amount": tokens_sold, "decimals": d} or None.
+    """
     tx = await get_transaction(signature)
     if not tx:
         return None
@@ -257,12 +289,12 @@ async def parse_buy(signature: str, mint: str):
         a_post, dec = amt(b)
         a_pre, _ = pre_map.get((b.get("owner"), mint), (0, dec))
         delta = a_post - a_pre
-        if delta > 0:
-            tokens = delta / (10 ** max(dec, 0))
-            return {"buyer": b.get("owner"), "amount": tokens, "decimals": dec}
+        if delta < 0:  # net decrease -> sold
+            tokens = (-delta) / (10 ** max(dec, 0))
+            return {"seller": b.get("owner"), "amount": tokens, "decimals": dec}
     return None
 
-# ---------------- TOKEN INFO + SYMBOL HELPERS ----------------
+# ---------- TOKEN INFO ----------
 async def fetch_token_info(mint: str):
     # 1) Pump.fun (best effort)
     try:
@@ -289,10 +321,11 @@ async def fetch_token_info(mint: str):
                     pairs = data.get("pairs", []) or []
                     if pairs:
                         pair = pairs[0]
-                        price_usd = float(pair.get("priceUsd", 0) or 0)
-                        fdv = float(pair.get("fdv", 0) or 0)
-                        symbol = (pair.get("baseToken") or {}).get("symbol", "TOKEN")
-                        return {"symbol": symbol, "price": price_usd, "mc": fdv}
+                        return {
+                            "symbol": (pair.get("baseToken") or {}).get("symbol", "TOKEN"),
+                            "price": float(pair.get("priceUsd", 0) or 0),
+                            "mc": float(pair.get("fdv", 0) or 0),
+                        }
     except Exception:
         pass
 
@@ -302,11 +335,11 @@ async def fetch_token_info(mint: str):
             async with session.get(COINGECKO_URL.format(mint)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    market_data = data.get("market_data") or {}
+                    md = data.get("market_data") or {}
                     return {
                         "symbol": (data.get("symbol") or "TOKEN").upper(),
-                        "price": float(((market_data.get("current_price") or {}).get("usd", 0)) or 0),
-                        "mc": float(((market_data.get("market_cap") or {}).get("usd", 0)) or 0),
+                        "price": float(((md.get("current_price") or {}).get("usd", 0)) or 0),
+                        "mc": float(((md.get("market_cap") or {}).get("usd", 0)) or 0),
                     }
     except Exception:
         pass
@@ -321,16 +354,15 @@ async def best_symbol_for_mint(mint: str):
     except Exception:
         return None
 
-# ---------------- POLLING ----------------
-async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
+# ---------- POLLING ----------
+async def poll_sells(context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT chat_id, mint, media_file_id, symbol FROM tracked_tokens")
+    c.execute("SELECT chat_id, mint, media_file_id, symbol, usd_threshold FROM sell_tracked")
     rows = c.fetchall()
     conn.close()
 
-    for chat_id, mint, media_file_id, symbol in rows:
-        # Skip native SOL
+    for chat_id, mint, media_file_id, symbol, usd_threshold in rows:
         if is_native_sol(mint):
             continue
 
@@ -340,61 +372,61 @@ async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             sig = txs[0].get("signature")
-            if not sig or last_seen.get(mint) == sig:
+            if not sig or sell_last_seen.get(mint) == sig:
                 continue
+            sell_last_seen[mint] = sig
 
-            last_seen[mint] = sig  # set early to avoid duplicates
-
-            # Ensure symbol cached
             if not symbol:
                 symbol = await best_symbol_for_mint(mint)
                 if symbol:
-                    update_symbol(mint, symbol)
+                    sell_update_symbol(mint, symbol)
 
-            token_info = await fetch_token_info(mint)
-            disp_symbol = symbol or token_info.get("symbol", "TOKEN")
-            price = float(token_info.get("price", 0) or 0)
-            mcap = float(token_info.get("mc", 0) or 0)
+            info = await fetch_token_info(mint)
+            disp_symbol = symbol or info.get("symbol", "TOKEN")
+            price = float(info.get("price", 0) or 0)
+            mcap = float(info.get("mc", 0) or 0)
 
-            details = await parse_buy(sig, mint)
+            details = await parse_sell(sig, mint)
             if not details:
                 continue
 
             amount = float(details.get("amount", 0) or 0)
-            buyer = details.get("buyer") or "?"
+            seller = details.get("seller") or "?"
             usd_value = amount * price if price else 0.0
 
-            # ---------- Styled alert ----------
+            # Whale gating (only alert if >= threshold)
+            threshold = float(usd_threshold) if usd_threshold and usd_threshold > 0 else DEFAULT_WHALE_USD
+            if usd_value < threshold:
+                continue
+
+            # Styled alert (sell)
             skulls = "💀" * 14
-            title = f"{disp_symbol} [{disp_symbol}] 💀Buy!"
+            title = f"{disp_symbol} [{disp_symbol}] 💀Sell!"
             tx_url = f"https://solscan.io/tx/{sig}"
 
             text = (
                 f"{title}\n\n"
                 f"{skulls}\n\n"
                 f"💀| {fmt_usd(usd_value)}\n"
-                f"💀| Got: {fmt_amount(amount)} {disp_symbol}\n"
-                f"💀| Buyer | Txn\n"
-                f"💀| Position: New\n"
+                f"💀| Sold: {fmt_amount(amount)} {disp_symbol}\n"
+                f"💀| Seller | Txn\n"
                 f"💀| Market Cap: {fmt_usd(mcap)}\n"
             )
 
-            # ---------- Buttons ----------
+            # Buttons (mirroring buy tracker style)
             jup = f"https://jup.ag/swap/SOL-{mint}"
             dexs = f"https://dexscreener.com/solana/{mint}"
             twitter = "https://x.com/sentrip_bot"
-            buyer_url = f"https://solscan.io/account/{buyer}" if buyer else tx_url
-            boost_url = "https://t.me/brhm_sol"  # your promo/CTA
+            seller_url = f"https://solscan.io/account/{seller}" if seller else tx_url
 
             buttons = [
                 [
                     InlineKeyboardButton("🐴 Buy", url=jup),
                     InlineKeyboardButton("💀 DexS", url=dexs),
                     InlineKeyboardButton("💀 Twitter", url=twitter),
-                    InlineKeyboardButton("⚡️ Boost with Odin", url=boost_url),
                 ],
                 [
-                    InlineKeyboardButton("Buyer", url=buyer_url),
+                    InlineKeyboardButton("Seller", url=seller_url),
                     InlineKeyboardButton("Txn", url=tx_url),
                 ],
             ]
@@ -406,39 +438,18 @@ async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id, text, reply_markup=markup)
 
         except Exception as e:
-            logging.error(f"Error polling {mint}: {e}")
+            logging.error(f"Error polling sells for {mint}: {e}")
 
-# ---------------- RPC (moved to bottom just for organization) ----------------
-async def fetch_transactions(mint: str, limit: int = 5):
-    payload = {
-        "jsonrpc": "2.0",
-        "id": "tx_fetch",
-        "method": "getSignaturesForAddress",
-        "params": [mint, {"limit": limit}],
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(HELIUS_URL, json=payload) as resp:
-            data = await resp.json()
-            return data.get("result", [])
-
-async def get_transaction(signature: str):
-    payload = {
-        "jsonrpc": "2.0",
-        "id": "tx_parse",
-        "method": "getTransaction",
-        "params": [signature, {"encoding": "jsonParsed"}],
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(HELIUS_URL, json=payload) as resp:
-            data = await resp.json()
-            return data.get("result")
-
-# ---------------- REGISTER ----------------
-def register_buytracker(app):
-    init_db()
-    app.add_handler(CommandHandler("track", cmd_track))
-    app.add_handler(CommandHandler("skip", cmd_skip))
-    app.add_handler(CommandHandler("untrack", cmd_untrack))
-    app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_media))
-    app.job_queue.run_repeating(poll_tracked, interval=30, first=5)
+# ---------- REGISTER ----------
+def register_selltracker(app):
+    init_sell_db()
+    # commands
+    app.add_handler(CommandHandler("track_sell", sell_track))
+    app.add_handler(CommandHandler("sell_skip", sell_skip))
+    app.add_handler(CommandHandler("untrack_sell", sell_untrack))
+    app.add_handler(CommandHandler("list_sells", sell_list))
+    app.add_handler(CommandHandler("sellthreshold", sell_setthreshold))
+    # media capture
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, sell_handle_media))
+    # background job
+    app.job_queue.run_repeating(poll_sells, interval=30, first=5)
