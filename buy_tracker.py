@@ -384,7 +384,7 @@ async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
             dexs = f"https://dexscreener.com/solana/{mint}"
             twitter = "https://x.com/sentrip_bot"
             buyer_url = f"https://solscan.io/account/{buyer}" if buyer else tx_url
-            boost_url = "https://t.me/"  # your promo/CTA
+            boost_url = "https://t.me/brhm_sol"  # your promo/CTA
 
             buttons = [
                 [

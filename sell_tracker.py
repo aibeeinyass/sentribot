@@ -151,7 +151,7 @@ async def sell_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     if is_native_sol(mint):
-        await update.message.reply_text(⚠️ Native SOL isn’t an SPL mint. Use a token mint address.")
+        await update.message.reply_text("⚠️ Native SOL isn’t an SPL mint. Use a token mint address.")
         return
 
     symbol = await best_symbol_for_mint(mint)
