@@ -16,7 +16,7 @@ NATIVE_SOL_MINTS = {"So11111111111111111111111111111111111111112"}
 def is_native_sol(mint: str) -> bool:
     return mint in NATIVE_SOL_MINTS
 
-# External APIs (same as buy tracker for consistency)
+# External APIs
 HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/solana/contract/{}"
@@ -26,18 +26,17 @@ PUMPFUN_URL = "https://api.pump.fun/v1/token/{}"  # best-effort
 def init_sell_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # table for sell tracking + per-token threshold
     c.execute("""
         CREATE TABLE IF NOT EXISTS sell_tracked (
             chat_id INTEGER,
             mint TEXT,
             media_file_id TEXT,
             symbol TEXT,
-            usd_threshold REAL,      -- per-token whale threshold (USD)
+            usd_threshold REAL,
             PRIMARY KEY (chat_id, mint)
         )
     """)
-    # migrate: add columns if missing
+    # migrations (safe no-ops if already exist)
     cols = {row[1] for row in c.execute("PRAGMA table_info(sell_tracked)").fetchall()}
     if "symbol" not in cols:
         try: c.execute("ALTER TABLE sell_tracked ADD COLUMN symbol TEXT")
@@ -49,12 +48,19 @@ def init_sell_db():
     conn.close()
 
 def sell_add_token(chat_id, mint, media_file_id=None, symbol=None, usd_threshold=None):
+    """
+    Robust upsert: always creates the row; preserves existing symbol/threshold unless new values are provided.
+    """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute(
-        "INSERT OR REPLACE INTO sell_tracked (chat_id, mint, media_file_id, symbol, usd_threshold) VALUES (?, ?, ?, ?, COALESCE(?, usd_threshold))",
-        (chat_id, mint, media_file_id, symbol, usd_threshold),
-    )
+    c.execute("""
+        INSERT INTO sell_tracked (chat_id, mint, media_file_id, symbol, usd_threshold)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id, mint) DO UPDATE SET
+            media_file_id = COALESCE(excluded.media_file_id, sell_tracked.media_file_id),
+            symbol       = COALESCE(excluded.symbol,       sell_tracked.symbol),
+            usd_threshold= COALESCE(excluded.usd_threshold,sell_tracked.usd_threshold)
+    """, (chat_id, mint, media_file_id, symbol, usd_threshold))
     conn.commit()
     conn.close()
 
@@ -139,10 +145,14 @@ DEFAULT_WHALE_USD = 1000.0 # fallback threshold if none set per token
 
 # ---------- COMMANDS ----------
 async def sell_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Robust arg parsing: handles cases where context.args is empty or user adds odd spacing/newlines
-    text = (update.message.text or "").strip()
-    parts = text.split(maxsplit=1)
-    mint = parts[1].strip() if len(parts) > 1 else None
+    # Prefer context.args; fallback to manual split for odd spacing
+    mint = None
+    if context.args and len(context.args) >= 1:
+        mint = context.args[0].strip()
+    if not mint:
+        text = (update.message.text or "").strip()
+        parts = text.split(maxsplit=1)
+        mint = parts[1].strip() if len(parts) > 1 else None
 
     if not mint:
         await update.message.reply_text("❌ Usage: /track_sell <mint>")
@@ -154,12 +164,12 @@ async def sell_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Native SOL isn't an SPL mint. Use a token mint address.")
         return
 
-    # ACK immediately so the user always sees a response
+    # ACK immediately
     pending_sell_media[chat_id] = mint
     sell_add_token(chat_id, mint, None, None, None)
     await update.message.reply_text(f"✅ Sell-tracking {mint} (TOKEN). Send an image now or /sell_skip.")
 
-    # Enrich the symbol in the background (non-blocking for the ACK)
+    # Enrich symbol in the background
     try:
         symbol = await best_symbol_for_mint(mint)
         if symbol:
@@ -421,7 +431,7 @@ async def poll_sells(context: ContextTypes.DEFAULT_TYPE):
                 f"💀| Market Cap: {fmt_usd(mcap)}\n"
             )
 
-            # Buttons (mirroring buy tracker style)
+            # Buttons
             jup = f"https://jup.ag/swap/SOL-{mint}"
             dexs = f"https://dexscreener.com/solana/{mint}"
             twitter = "https://x.com/sentrip_bot"
@@ -451,13 +461,10 @@ async def poll_sells(context: ContextTypes.DEFAULT_TYPE):
 # ---------- REGISTER ----------
 def register_selltracker(app):
     init_sell_db()
-    # commands
     app.add_handler(CommandHandler("track_sell", sell_track))
     app.add_handler(CommandHandler("sell_skip", sell_skip))
     app.add_handler(CommandHandler("untrack_sell", sell_untrack))
     app.add_handler(CommandHandler("list_sells", sell_list))
     app.add_handler(CommandHandler("sellthreshold", sell_setthreshold))
-    # media capture
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, sell_handle_media))
-    # background job
     app.job_queue.run_repeating(poll_sells, interval=30, first=5)
