@@ -151,13 +151,21 @@ async def sell_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     if is_native_sol(mint):
-        await update.message.reply_text("⚠️ Native SOL isn’t an SPL mint. Use a token mint address.")
+        await update.message.reply_text("⚠️ Native SOL isn't an SPL mint. Use a token mint address.")
         return
 
-    symbol = await best_symbol_for_mint(mint)
+    # ACK immediately so the user always sees a response
     pending_sell_media[chat_id] = mint
-    sell_add_token(chat_id, mint, None, symbol, None)
-    await update.message.reply_text(f"✅ Sell-tracking {mint} ({symbol or 'TOKEN'}). Send an image now or /sell_skip.")
+    sell_add_token(chat_id, mint, None, None, None)
+    await update.message.reply_text(f"✅ Sell-tracking {mint} (TOKEN). Send an image now or /sell_skip.")
+
+    # Enrich the symbol in the background (non-blocking for the ACK)
+    try:
+        symbol = await best_symbol_for_mint(mint)
+        if symbol:
+            sell_update_symbol(mint, symbol)
+    except Exception as e:
+        logging.error(f"sell_track: symbol lookup failed for {mint}: {e}")
 
 async def sell_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
