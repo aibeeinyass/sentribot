@@ -130,36 +130,54 @@ def fmt_num(n):
 
 # ========= COMMANDS =========
 async def x_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not X_BEARER_TOKEN:
-        await update.message.reply_text("❌ X alerts are not configured. Missing X_BEARER_TOKEN.")
-        return
+    # Always answer something, even on unexpected errors
+    try:
+        if not X_BEARER_TOKEN:
+            await update.message.reply_text("❌ X alerts are not configured. Missing X_BEARER_TOKEN.")
+            return
 
-    # fallback: use raw message text
-    text = (update.message.text or "").strip()
-    parts = text.split(maxsplit=1)
-    handle = parts[1].strip().lstrip("@") if len(parts) > 1 else None
+        # Arg parsing with raw-text fallback (handles '/x_track@YourBot elonmusk', extra spaces, etc.)
+        text = (update.message.text or "").strip()
+        parts = text.split(maxsplit=1)
+        handle = None
+        if len(parts) > 1 and parts[1].strip():
+            handle = parts[1].strip().lstrip("@")
+        elif context.args:
+            handle = context.args[0].strip().lstrip("@")
 
-    if not handle:
-        await update.message.reply_text("❌ Usage: /x_track <handle>")
-        return
+        if not handle:
+            await update.message.reply_text("❌ Usage: /x_track <handle>")
+            return
 
-    chat_id = update.effective_chat.id
+        chat_id = update.effective_chat.id
 
-    user = await x_get_user_by_handle(handle)
-    if not user:
-        await update.message.reply_text("❌ Couldn’t find that X handle.")
-        return
+        # Lookup the user on X
+        user = await x_get_user_by_handle(handle)
+        if not user:
+            await update.message.reply_text(f"❌ Couldn’t find that X handle: @{handle}")
+            return
 
-    user_id = user["id"]
-    display = user.get("name") or handle
-    x_add_account(chat_id, handle, user_id, display)
+        user_id = user.get("id")
+        display = user.get("name") or handle
 
-    # seed follower cache
-    followers = await x_get_followers(user_id, max_results=200)
-    for f in followers:
-        x_add_follower(user_id, f["id"])
+        # Save account
+        x_add_account(chat_id, handle, user_id, display)
 
-    await update.message.reply_text(f"✅ Now watching @{handle} for new followers.")
+        # Seed follower cache (avoid spamming historical followers)
+        try:
+            followers = await x_get_followers(user_id, max_results=200)
+            for f in followers:
+                fid = f.get("id")
+                if fid:
+                    x_add_follower(user_id, fid)
+        except Exception as seeding_err:
+            logging.error(f"Seeding followers failed for @{handle}: {seeding_err}")
+
+        await update.message.reply_text(f"✅ Now watching @{handle} for new followers.")
+
+    except Exception as e:
+        logging.exception(f"/x_track crashed: {e}")
+        await update.message.reply_text("❌ Something went wrong while setting X alerts. Check logs and your token.")
 
 async def x_untrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
