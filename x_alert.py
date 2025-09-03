@@ -229,6 +229,32 @@ async def x_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     head = (X_BEARER_TOKEN[:8] + "…") if X_BEARER_TOKEN else "—"
     await update.message.reply_text(f"🔎 X token: {masked} (starts with: {head})")
 
+# --- NEW: direct API test command to surface exact HTTP status/body ---
+async def x_testuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not X_BEARER_TOKEN:
+        await update.message.reply_text("❌ X alerts are not configured. Missing X_BEARER_TOKEN.")
+        return
+
+    text = (update.message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    handle = parts[1].strip().lstrip("@") if len(parts) > 1 else None
+    if not handle:
+        await update.message.reply_text("❌ Usage: /x_testuser <handle>")
+        return
+
+    url = f"{X_API_BASE}/users/by/username/{handle}"
+    params = {"user.fields": "name,username"}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, headers=HEADERS, params=params) as r:
+                body = await r.text()
+                preview = (body[:600] + "…") if len(body) > 600 else body
+                await update.message.reply_text(
+                    f"HTTP {r.status}\nURL: {url}\nHeaders ok: {'Authorization' in HEADERS and bool(HEADERS['Authorization'])}\n\nBody:\n{preview}"
+                )
+    except Exception as e:
+        await update.message.reply_text(f"Exception during call: {e}")
+
 # ========= POLLING JOB =========
 async def poll_x_followers(context: ContextTypes.DEFAULT_TYPE):
     if not X_BEARER_TOKEN:
@@ -298,5 +324,6 @@ def register_x_alert(app):
     app.add_handler(CommandHandler("x_untrack", x_untrack))
     app.add_handler(CommandHandler("x_list", x_list))
     app.add_handler(CommandHandler("x_debug", x_debug))
+    app.add_handler(CommandHandler("x_testuser", x_testuser))  # <-- NEW registration
     # poll every 2 minutes (adjust to your rate/needs)
     app.job_queue.run_repeating(poll_x_followers, interval=120, first=10)
