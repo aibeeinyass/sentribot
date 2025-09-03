@@ -1,12 +1,13 @@
 import os
 from datetime import datetime
 
-from telegram import Update, ChatPermissions
+from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup  # <-- added buttons
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     ChatMemberHandler,
+    CallbackQueryHandler,  # <-- added callback handler
     ContextTypes,
     filters,
 )
@@ -27,33 +28,93 @@ welcome_messages = {}
 DEFAULT_WELCOME = welcome_message
 
 
+# -------- HELP MENU (button-based) --------
+def _render_help_section(section: str) -> tuple[str, InlineKeyboardMarkup]:
+    section = (section or "menu").lower()
+
+    # Buttons row
+    rows = [
+        [
+            InlineKeyboardButton("👋 General", callback_data="help:general"),
+            InlineKeyboardButton("🟢 Buy", callback_data="help:buy"),
+        ],
+        [
+            InlineKeyboardButton("🔴 Sell", callback_data="help:sell"),
+            InlineKeyboardButton("🐦 X Alerts", callback_data="help:x"),
+        ],
+    ]
+    if section != "menu":
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="help:menu")])
+
+    kb = InlineKeyboardMarkup(rows)
+
+    if section == "general":
+        text = (
+            "✨ *SentriBot — General*\n\n"
+            "• /start — Greet the bot\n"
+            "• /rules — Show rules\n"
+            "• /about — About the bot\n"
+            "• /setwelcome <message> — Change welcome text\n"
+            "• /warn — Warn a user (reply)\n"
+            "• /pin — Pin the latest message\n"
+        )
+    elif section == "buy":
+        text = (
+            "🟢 *Buy Tracker*\n\n"
+            "• /track <mint> — Start buy tracking\n"
+            "• /untrack <mint> — Stop buy tracking\n"
+            "• /list — List tracked tokens\n"
+            "• /skip <txsig> — Ignore a transaction\n"
+        )
+    elif section == "sell":
+        text = (
+            "🔴 *Sell Tracker*\n\n"
+            "• /track_sell <mint> — Start sell tracking\n"
+            "• /sell_skip — Skip media for last /track_sell\n"
+            "• /untrack_sell <mint> — Stop sell tracking\n"
+            "• /list_sells — List tracked tokens (with whale threshold)\n"
+            "• /sellthreshold <mint> <usd> — Set whale alert threshold\n"
+        )
+    elif section == "x":
+        text = (
+            "🐦 *X Alerts*\n\n"
+            "• /x_track <handle> — Track new followers for an account\n"
+            "• /x_untrack <handle> — Stop tracking\n"
+            "• /x_list — List tracked X accounts\n"
+            "• /x_debug — Check X API token status\n"
+            "• /x_testuser <handle> — Test lookup (debug)\n\n"
+            "_Followers are checked every 2 minutes._"
+        )
+    else:
+        # Menu intro
+        text = (
+            "✨ *SentriBot Help*\n"
+            "Tap a category below to see commands."
+        )
+
+    return text, kb
+
+async def help_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, section = (q.data.split(":", 1) + ["menu"])[:2]
+    text, kb = _render_help_section(section)
+    try:
+        await q.edit_message_text(text=text, reply_markup=kb, parse_mode="Markdown")
+    except Exception:
+        await q.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
+
+
 # -------- COMMAND HANDLERS --------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Hello! I’m SentriBot — keeping your group safe and fun!")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📌 Commands:\n"
-        "/start - Greet the bot\n"
-        "/help - Show this menu\n"
-        "/rules - Show rules\n"
-        "/about - About the bot\n"
-        "/setwelcome <message> - Change welcome text\n"
-        "/warn - Warn a user (reply to a message)\n"
-        "/pin - Pin the latest message\n"
-        "📊 Buy Tracker Commands:\n"
-        "/track <mint> - Track token buys\n"
-        "/untrack <mint> - Stop tracking a token\n"
-        "/list - List tracked tokens\n"
-        "/skip <txsig> - Ignore a specific transaction\n\n"
-        "📌 Sell Tracker Commands:\n"
-        "/track_sell <mint> - Start sell tracking for a mint\n"
-        "/sell_skip - Skip attaching media for the last /track_sell\n"
-        "/untrack_sell <mint> - Stop sell tracking\n"
-        "/list_sells - List tracked tokens (shows per-token whale threshold)\n"
-        "/sellthreshold <mint> <usd> - Set whale alert threshold (USD) for that token"
-    )
+    # Show button menu (supports '/help sell' to open a tab directly)
+    section = (context.args[0] if context.args else "menu")
+    text, kb = _render_help_section(section)
+    await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
 
 
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -241,6 +302,9 @@ def main():
     register_buytracker(app)   # <-- plug in all /track, /untrack, /list etc.
     register_selltracker(app)
     register_x_alert(app)
+
+    # -------- HELP menu callback (must be registered) --------
+    app.add_handler(CallbackQueryHandler(help_menu_cb, pattern=r"^help:"))
 
     app.run_polling()
 
