@@ -134,7 +134,7 @@ async def x_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ X alerts are not configured. Missing X_BEARER_TOKEN.")
         return
 
-    # Robust parsing
+    # fallback: use raw message text
     text = (update.message.text or "").strip()
     parts = text.split(maxsplit=1)
     handle = parts[1].strip().lstrip("@") if len(parts) > 1 else None
@@ -144,6 +144,7 @@ async def x_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
+
     user = await x_get_user_by_handle(handle)
     if not user:
         await update.message.reply_text("❌ Couldn’t find that X handle.")
@@ -153,7 +154,7 @@ async def x_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     display = user.get("name") or handle
     x_add_account(chat_id, handle, user_id, display)
 
-    # seed follower cache (avoid spamming old followers)
+    # seed follower cache
     followers = await x_get_followers(user_id, max_results=200)
     for f in followers:
         x_add_follower(user_id, f["id"])
@@ -161,15 +162,10 @@ async def x_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Now watching @{handle} for new followers.")
 
 async def x_untrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Robust parsing
-    text = (update.message.text or "").strip()
-    parts = text.split(maxsplit=1)
-    handle = parts[1].strip().lstrip("@") if len(parts) > 1 else None
-
-    if not handle:
+    if not context.args:
         await update.message.reply_text("❌ Usage: /x_untrack <handle>")
         return
-
+    handle = context.args[0].strip().lstrip("@")
     chat_id = update.effective_chat.id
     x_remove_account(chat_id, handle)
     await update.message.reply_text(f"🗑 Stopped watching @{handle}.")
