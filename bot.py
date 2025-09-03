@@ -13,6 +13,7 @@ from telegram.ext import (
 
 from buy_tracker import register_buytracker   # <-- NEW
 from sell_tracker import register_selltracker
+from x_alert import register_x_alert
 
 TOKEN = os.getenv("BOT_TOKEN")
 
@@ -239,6 +240,7 @@ def main():
     # -------- BUY/SELL TRACKERS --------
     register_buytracker(app)   # <-- plug in all /track, /untrack, /list etc.
     register_selltracker(app)
+    register_x_alert(app)
 
     app.run_polling()
 
