@@ -84,39 +84,60 @@ def x_add_follower(tracked_user_id: str, follower_id: str):
 X_API_BASE = "https://api.twitter.com/2"
 
 HEADERS = {
-    "Authorization": f"Bearer {X_BEARER_TOKEN}" if X_BEARER_TOKEN else ""
+    "Authorization": f"Bearer {X_BEARER_TOKEN}" if X_BEARER_TOKEN else "",
+    "User-Agent": "Sentribot/1.0"
 }
 
-async def x_get_user_by_handle(handle: str) -> Optional[Dict]:
-    """Returns {'id': '...', 'name': '...', 'username': '...'} or None"""
+async def _x_get_json(url: str, params: dict | None = None):
+    """Return (json_or_none, error_text_or_none, status_code)."""
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url, headers=HEADERS, params=params or {}) as r:
+            status = r.status
+            try:
+                data = await r.json()
+            except Exception:
+                txt = await r.text()
+                return None, f"HTTP {status}: {txt[:200]}", status
+            if status != 200:
+                # X often returns structured errors
+                err_msg = ""
+                if isinstance(data, dict) and "errors" in data:
+                    try:
+                        err_msg = "; ".join(
+                            f"{e.get('title','')}: {e.get('detail','')}" for e in data["errors"]
+                        )
+                    except Exception:
+                        err_msg = str(data)[:200]
+                if not err_msg:
+                    err_msg = str(data)[:200]
+                return None, f"HTTP {status}: {err_msg}", status
+            return data, None, status
+
+async def x_get_user_by_handle(handle: str):
+    """
+    Returns (data_dict, error_text). data_dict like {'id','name','username'} when OK.
+    """
     handle = handle.lstrip("@")
     url = f"{X_API_BASE}/users/by/username/{handle}"
     params = {"user.fields": "name,username"}
-    async with aiohttp.ClientSession() as s:
-        async with s.get(url, headers=HEADERS, params=params) as r:
-            if r.status != 200:
-                logging.error(f"X user lookup failed {r.status} for {handle}")
-                return None
-            data = await r.json()
-            return data.get("data")
+    data, err, _ = await _x_get_json(url, params)
+    if err:
+        return None, err
+    return data.get("data"), None
 
-async def x_get_followers(user_id: str, max_results: int = 200) -> List[Dict]:
+async def x_get_followers(user_id: str, max_results: int = 200):
     """
-    Fetches the most recent followers (first page). Good enough for polling.
-    Returns list of followers with id, name, username, profile_image_url, verified, public_metrics.
+    Returns (followers_list, error_text)
     """
     url = f"{X_API_BASE}/users/{user_id}/followers"
     params = {
         "max_results": str(max(10, min(max_results, 1000))),  # clamp to 1000
         "user.fields": "name,username,verified,profile_image_url,public_metrics"
     }
-    async with aiohttp.ClientSession() as s:
-        async with s.get(url, headers=HEADERS, params=params) as r:
-            if r.status != 200:
-                logging.error(f"X followers fetch failed {r.status} for {user_id}")
-                return []
-            data = await r.json()
-            return data.get("data", []) or []
+    data, err, _ = await _x_get_json(url, params)
+    if err:
+        return [], err
+    return (data.get("data", []) or []), None
 
 # ========= HELPERS =========
 def fmt_num(n):
@@ -152,7 +173,10 @@ async def x_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
 
         # Lookup the user on X
-        user = await x_get_user_by_handle(handle)
+        user, err = await x_get_user_by_handle(handle)
+        if err:
+            await update.message.reply_text(f"❌ X lookup failed for @{handle}: {err}")
+            return
         if not user:
             await update.message.reply_text(f"❌ Couldn’t find that X handle: @{handle}")
             return
@@ -164,14 +188,15 @@ async def x_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
         x_add_account(chat_id, handle, user_id, display)
 
         # Seed follower cache (avoid spamming historical followers)
-        try:
-            followers = await x_get_followers(user_id, max_results=200)
+        followers, f_err = await x_get_followers(user_id, max_results=200)
+        if f_err:
+            # Not fatal — still enable tracking
+            logging.error(f"Seeding followers failed for @{handle}: {f_err}")
+        else:
             for f in followers:
                 fid = f.get("id")
                 if fid:
                     x_add_follower(user_id, fid)
-        except Exception as seeding_err:
-            logging.error(f"Seeding followers failed for @{handle}: {seeding_err}")
 
         await update.message.reply_text(f"✅ Now watching @{handle} for new followers.")
 
@@ -199,6 +224,11 @@ async def x_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• {display} (@{handle}) — id: {user_id}")
     await update.message.reply_text("🐦 X accounts watched:\n" + "\n".join(lines))
 
+async def x_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    masked = "present" if X_BEARER_TOKEN else "missing"
+    head = (X_BEARER_TOKEN[:8] + "…") if X_BEARER_TOKEN else "—"
+    await update.message.reply_text(f"🔎 X token: {masked} (starts with: {head})")
+
 # ========= POLLING JOB =========
 async def poll_x_followers(context: ContextTypes.DEFAULT_TYPE):
     if not X_BEARER_TOKEN:
@@ -212,12 +242,16 @@ async def poll_x_followers(context: ContextTypes.DEFAULT_TYPE):
 
     for chat_id, handle, user_id, display in rows:
         try:
-            followers = await x_get_followers(user_id, max_results=200)
-            if not followers:
+            followers, err = await x_get_followers(user_id, max_results=200)
+            if err or not followers:
+                if err:
+                    logging.error(f"X followers fetch failed for @{handle}: {err}")
                 continue
 
             for f in followers:
-                fid = f["id"]
+                fid = f.get("id")
+                if not fid:
+                    continue
                 if x_has_follower(user_id, fid):
                     continue  # already seen
 
@@ -263,5 +297,6 @@ def register_x_alert(app):
     app.add_handler(CommandHandler("x_track", x_track))
     app.add_handler(CommandHandler("x_untrack", x_untrack))
     app.add_handler(CommandHandler("x_list", x_list))
+    app.add_handler(CommandHandler("x_debug", x_debug))
     # poll every 2 minutes (adjust to your rate/needs)
     app.job_queue.run_repeating(poll_x_followers, interval=120, first=10)
