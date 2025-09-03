@@ -8,7 +8,19 @@ from typing import Optional, Tuple, List, Dict
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CommandHandler, MessageHandler, ContextTypes, filters
 
-X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN")
+# ---- TOKEN SANITIZER (fix header injection error) ----
+def _clean_token(tok: Optional[str]) -> str:
+    if not tok:
+        return ""
+    tok = tok.replace("\r", "").replace("\n", "").strip()
+    # strip accidental surrounding quotes
+    if (tok.startswith('"') and tok.endswith('"')) or (tok.startswith("'") and tok.endswith("'")):
+        tok = tok[1:-1].strip()
+    return tok
+
+RAW_X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN")
+X_BEARER_TOKEN = _clean_token(RAW_X_BEARER_TOKEN)
+
 DB_PATH = "tracked_tokens.db"
 logging.basicConfig(level=logging.INFO)
 
@@ -85,7 +97,7 @@ X_API_BASE = "https://api.twitter.com/2"
 
 HEADERS = {
     "Authorization": f"Bearer {X_BEARER_TOKEN}" if X_BEARER_TOKEN else "",
-    "User-Agent": "Sentribot/1.0"
+    "User-Agent": "Sentribot/1.0",
 }
 
 async def _x_get_json(url: str, params: dict | None = None):
@@ -99,7 +111,6 @@ async def _x_get_json(url: str, params: dict | None = None):
                 txt = await r.text()
                 return None, f"HTTP {status}: {txt[:200]}", status
             if status != 200:
-                # X often returns structured errors
                 err_msg = ""
                 if isinstance(data, dict) and "errors" in data:
                     try:
@@ -114,9 +125,7 @@ async def _x_get_json(url: str, params: dict | None = None):
             return data, None, status
 
 async def x_get_user_by_handle(handle: str):
-    """
-    Returns (data_dict, error_text). data_dict like {'id','name','username'} when OK.
-    """
+    """Returns (data_dict, error_text). data_dict has {'id','name','username'} when OK."""
     handle = handle.lstrip("@")
     url = f"{X_API_BASE}/users/by/username/{handle}"
     params = {"user.fields": "name,username"}
@@ -126,13 +135,11 @@ async def x_get_user_by_handle(handle: str):
     return data.get("data"), None
 
 async def x_get_followers(user_id: str, max_results: int = 200):
-    """
-    Returns (followers_list, error_text)
-    """
+    """Returns (followers_list, error_text)."""
     url = f"{X_API_BASE}/users/{user_id}/followers"
     params = {
-        "max_results": str(max(10, min(max_results, 1000))),  # clamp to 1000
-        "user.fields": "name,username,verified,profile_image_url,public_metrics"
+        "max_results": str(max(10, min(max_results, 1000))),
+        "user.fields": "name,username,verified,profile_image_url,public_metrics",
     }
     data, err, _ = await _x_get_json(url, params)
     if err:
@@ -157,7 +164,7 @@ async def x_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ X alerts are not configured. Missing X_BEARER_TOKEN.")
             return
 
-        # Arg parsing with raw-text fallback (handles '/x_track@YourBot elonmusk', extra spaces, etc.)
+        # Arg parsing with raw-text fallback
         text = (update.message.text or "").strip()
         parts = text.split(maxsplit=1)
         handle = None
@@ -190,7 +197,6 @@ async def x_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Seed follower cache (avoid spamming historical followers)
         followers, f_err = await x_get_followers(user_id, max_results=200)
         if f_err:
-            # Not fatal — still enable tracking
             logging.error(f"Seeding followers failed for @{handle}: {f_err}")
         else:
             for f in followers:
@@ -226,22 +232,20 @@ async def x_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def x_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     masked = "present" if X_BEARER_TOKEN else "missing"
+    has_newlines = "\\n" if RAW_X_BEARER_TOKEN and any(c in RAW_X_BEARER_TOKEN for c in "\r\n") else "no-nl"
     head = (X_BEARER_TOKEN[:8] + "…") if X_BEARER_TOKEN else "—"
-    await update.message.reply_text(f"🔎 X token: {masked} (starts with: {head})")
+    await update.message.reply_text(f"🔎 X token: {masked} ({has_newlines}), starts with: {head}")
 
-# --- NEW: direct API test command to surface exact HTTP status/body ---
 async def x_testuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not X_BEARER_TOKEN:
         await update.message.reply_text("❌ X alerts are not configured. Missing X_BEARER_TOKEN.")
         return
-
     text = (update.message.text or "").strip()
     parts = text.split(maxsplit=1)
     handle = parts[1].strip().lstrip("@") if len(parts) > 1 else None
     if not handle:
         await update.message.reply_text("❌ Usage: /x_testuser <handle>")
         return
-
     url = f"{X_API_BASE}/users/by/username/{handle}"
     params = {"user.fields": "name,username"}
     try:
@@ -250,7 +254,7 @@ async def x_testuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 body = await r.text()
                 preview = (body[:600] + "…") if len(body) > 600 else body
                 await update.message.reply_text(
-                    f"HTTP {r.status}\nURL: {url}\nHeaders ok: {'Authorization' in HEADERS and bool(HEADERS['Authorization'])}\n\nBody:\n{preview}"
+                    f"HTTP {r.status}\nURL: {url}\nAuth header ok: {bool(X_BEARER_TOKEN)}\n\nBody:\n{preview}"
                 )
     except Exception as e:
         await update.message.reply_text(f"Exception during call: {e}")
@@ -291,7 +295,6 @@ async def poll_x_followers(context: ContextTypes.DEFAULT_TYPE):
                 f_count = fmt_num(metrics.get("followers_count", 0))
                 p_count = fmt_num(metrics.get("tweet_count", 0))
 
-                # Build alert
                 title = f"🐦 New Follower for @{handle}!"
                 text = (
                     f"{title}\n\n"
@@ -324,6 +327,5 @@ def register_x_alert(app):
     app.add_handler(CommandHandler("x_untrack", x_untrack))
     app.add_handler(CommandHandler("x_list", x_list))
     app.add_handler(CommandHandler("x_debug", x_debug))
-    app.add_handler(CommandHandler("x_testuser", x_testuser))  # <-- NEW registration
-    # poll every 2 minutes (adjust to your rate/needs)
+    app.add_handler(CommandHandler("x_testuser", x_testuser))
     app.job_queue.run_repeating(poll_x_followers, interval=120, first=10)
