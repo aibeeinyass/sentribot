@@ -703,7 +703,7 @@ def register_moderation(app: Application):
     app.post_init = _post_init
 
     # Commands
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start", start), block=false)
     app.add_handler(CommandHandler("continue", continue_cmd))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("rules", rules))
