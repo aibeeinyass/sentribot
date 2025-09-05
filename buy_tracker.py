@@ -22,7 +22,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
-    ApplicationHandlerStop,   # safe to keep; used nowhere now but fine
+    ApplicationHandlerStop,   # we'll use this in the DM gate
 )
 
 # ---------------- SETTINGS ----------------
@@ -70,7 +70,7 @@ def _pop_valid_code(code: str, user_id: int) -> Optional[int]:
     if time.time() - data["ts"] > PAIR_CODE_TTL_SEC:
         PAIR_CODES.pop(code, None)
         return None
-    # bind to the same user who initiated in group (prevents hijack)
+    # bind to same user
     if data["user_id"] != user_id:
         return None
     PAIR_CODES.pop(code, None)
@@ -365,7 +365,6 @@ async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
             markup = InlineKeyboardMarkup(buttons)
 
             if media_file_id:
-                # Try sending as photo; if it fails, fallback to message
                 try:
                     await context.bot.send_photo(
                         chat_id,
@@ -416,7 +415,7 @@ async def cmd_track_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = _gen_pair_code()
     _put_code(code, origin_chat_id=chat.id, user_id=user.id)
 
-    # 🔴 NEW: mark this user as "awaiting code" so DM accepts plain text immediately
+    # mark user pending so DM accepts plain text immediately
     PENDING_DM[user.id] = {
         "stage": "await_code",
         "origin_chat_id": chat.id,
@@ -437,12 +436,54 @@ async def cmd_track_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
     )
 
-# ---------------- DM ENTRY via "track <code>" (NO /start) ----------------
+# ---------------- DM GATE (HIGH PRIORITY, like your welcome/rules gate) ----------------
 PAIR_RX = re.compile(r"^\s*track\s+(\d{6})\s*$", re.IGNORECASE)
 ANY_CODE_RX = re.compile(r"\b(\d{6})\b")
 
+async def buy_dm_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Intercept DM while buy-tracker setup is pending; route and stop others."""
+    chat = update.effective_chat
+    msg = update.message
+    if not chat or chat.type != "private" or not msg or not (msg.text or msg.caption):
+        return
+
+    uid = update.effective_user.id
+    state = PENDING_DM.get(uid)
+    if not state:
+        return  # not in our flow; let others handle
+
+    # Block bot commands while configuring, like your moderation DM gate
+    if any(e.type == "bot_command" for e in (msg.entities or [])) or msg.text.strip().startswith("/"):
+        await msg.reply_text("Please send the text only (no /commands).")
+        raise ApplicationHandlerStop
+
+    # If they’re at await_code, accept “track 123456” or just “123456”
+    if state.get("stage") == "await_code":
+        text = msg.text.strip()
+        m = PAIR_RX.match(text) or ANY_CODE_RX.search(text)
+        if not m:
+            await msg.reply_text(
+                "Please send the pairing code I gave you in the group (e.g., <code>track 123456</code> or just <code>123456</code>).",
+                parse_mode="HTML",
+            )
+            raise ApplicationHandlerStop
+        code = m.group(1)
+        origin_from_code = _pop_valid_code(code, uid)
+        if not origin_from_code or origin_from_code != state.get("origin_chat_id"):
+            await msg.reply_text("❌ Invalid or expired code. Go back to your group and run /track again.")
+            raise ApplicationHandlerStop
+        # advance
+        state["stage"] = "ask_mint"
+        await msg.reply_text("🧭 Send the <b>mint address</b> you want to track.", parse_mode="HTML")
+        raise ApplicationHandlerStop
+
+    # Otherwise, route to our normal DM text router and stop
+    await dm_text_router(update, context)
+    raise ApplicationHandlerStop
+
+# ---------------- DM ENTRY via "track <code>" (works even without pending) ----------------
 async def dm_entry_by_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """DM-only: user sends 'track 123456' to begin the wizard (works even without pending state)."""
+    """DM-only: user sends 'track 123456' to begin the wizard (even if no pending state)."""
     chat = update.effective_chat
     msg = update.message
     if chat.type != "private" or not msg or not msg.text:
@@ -478,30 +519,7 @@ async def dm_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stage = state.get("stage")
     origin = state.get("origin_chat_id")
 
-    # 🔴 NEW: waiting for the pairing code (plain text accepted)
-    if stage == "await_code":
-        text = msg.text.strip()
-        # accept either "track 123456" or any 6 digits in the message
-        m = PAIR_RX.match(text) or ANY_CODE_RX.search(text)
-        if not m:
-            await msg.reply_text(
-                "Please send the pairing code I gave you in the group (e.g., <code>track 123456</code> or just <code>123456</code>).",
-                parse_mode="HTML",
-            )
-            return
-
-        code = m.group(1)
-        origin_from_code = _pop_valid_code(code, uid)
-        if not origin_from_code or origin_from_code != origin:
-            await msg.reply_text("❌ Invalid or expired code. Go back to your group and run /track again.")
-            return
-
-        # advance to mint step
-        state["stage"] = "ask_mint"
-        await msg.reply_text("🧭 Send the <b>mint address</b> you want to track.", parse_mode="HTML")
-        return
-
-    # Disallow commands inside the rest of the flow
+    # Disallow commands inside the flow
     if msg.text.strip().startswith("/"):
         await msg.reply_text("Please send text (no /commands) while configuring.")
         return
@@ -511,11 +529,14 @@ async def dm_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_native_sol(mint):
             await msg.reply_text("⚠️ Native SOL isn’t an SPL mint. Send a token mint address.")
             return
-        info = await fetch_token_info(mint)
-        symbol = info.get("symbol") or "TOKEN"
-        name = info.get("name") or symbol
+        try:
+            info = await fetch_token_info(mint)
+        except Exception:
+            info = {"symbol": "TOKEN", "name": "TOKEN"}
+        symbol = (info.get("symbol") or "TOKEN")
+        name = (info.get("name") or symbol)
         state["mint"] = mint
-        # store basic defaults immediately
+        # store defaults
         upsert_token(origin, mint, symbol=symbol, min_buy_usd=DEFAULT_MIN_BUY_USD)
         kb = InlineKeyboardMarkup(
             [
@@ -565,7 +586,6 @@ async def dm_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if stage == "set_socials":
-        # Accept key:value lines or JSON
         text = msg.text.strip()
         data = {}
         try:
@@ -677,13 +697,11 @@ async def bt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "bt:set:done":
-        # Activate & announce in group
         if not mint:
             await q.message.reply_text("Missing token context. Please start over with /track in your group.")
             PENDING_DM.pop(uid, None)
             return
         set_active(origin, mint, True)
-        # Fetch symbol for nicer message
         row = get_token_row(origin, mint)
         symbol = (row[1] if row else None) or (await best_symbol_for_mint(mint) or "TOKEN")
         try:
@@ -735,9 +753,11 @@ def register_buytracker(app):
     # GROUP command to kick off pairing
     app.add_handler(CommandHandler("track", cmd_track_group, filters.ChatType.GROUPS))
 
-    # DM entry via "track <code>" (NOT /start). Put before general DM routers if any.
-    # make this HIGHER priority than other DM gates
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, dm_entry_by_code), group=-200)
+    # DM entry via "track <code>" — VERY high priority
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, dm_entry_by_code), group=-300)
+
+    # 🔴 NEW: High-priority DM gate for buy tracker (runs after the code-catcher above)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.TEXT | filters.Caption()), buy_dm_gate), group=-250)
 
     # DM callbacks & text/media during configuration
     app.add_handler(CallbackQueryHandler(bt_callback, pattern=r"^bt:(confirm|again|set:.*)"))
