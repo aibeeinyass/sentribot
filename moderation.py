@@ -103,14 +103,10 @@ async def _is_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: i
 def _render_help_section(section: str) -> Tuple[str, InlineKeyboardMarkup]:
     section = (section or "menu").lower()
     rows = [
-        [
-            InlineKeyboardButton("👋 General", callback_data="help:general"),
-            InlineKeyboardButton("🟢 Buy", callback_data="help:buy"),
-        ],
-        [
-            InlineKeyboardButton("🔴 Sell", callback_data="help:sell"),
-            InlineKeyboardButton("🐦 X Alerts", callback_data="help:x"),
-        ],
+        [InlineKeyboardButton("👋 General", callback_data="help:general"),
+         InlineKeyboardButton("🟢 Buy", callback_data="help:buy")],
+        [InlineKeyboardButton("🔴 Sell", callback_data="help:sell"),
+         InlineKeyboardButton("🐦 X Alerts", callback_data="help:x")],
     ]
     if section != "menu":
         rows.append([InlineKeyboardButton("⬅️ Back", callback_data="help:menu")])
@@ -118,47 +114,47 @@ def _render_help_section(section: str) -> Tuple[str, InlineKeyboardMarkup]:
 
     if section == "general":
         text = (
-            "✨ SentriBot — General\n\n"
+            "<b>✨ SentriBot — General</b>\n\n"
             "/start — Greet the bot\n"
             "/rules — Show rules\n"
             "/about — About the bot\n"
             "/setwelcome — Set welcome message (DM flow)\n"
             "/setrules — Set /rules text (DM flow)\n"
-            "/filter <trigger> — Add a filter\n"
+            "/filter &lt;trigger&gt; — Add a filter (interactive)\n"
             "/filters — List filters\n"
-            "/delfilter <trigger> — Delete a filter\n"
+            "/delfilter &lt;trigger&gt; — Delete a filter\n"
             "/warn — Warn a user (reply)\n"
-            "/pin — Pin the latest message"
+            "/pin — Pin the latest message\n"
         )
     elif section == "buy":
         text = (
-            "🟢 Buy Tracker\n\n"
-            "/track <mint> — Start buy tracking\n"
-            "/untrack <mint> — Stop buy tracking\n"
+            "<b>🟢 Buy Tracker</b>\n\n"
+            "/track &lt;mint&gt; — Start buy tracking\n"
+            "/untrack &lt;mint&gt; — Stop buy tracking\n"
             "/list — List tracked tokens\n"
-            "/skip <txsig> — Ignore a transaction"
+            "/skip &lt;txsig&gt; — Ignore a transaction\n"
         )
     elif section == "sell":
         text = (
-            "🔴 Sell Tracker\n\n"
-            "/track_sell <mint> — Start sell tracking\n"
+            "<b>🔴 Sell Tracker</b>\n\n"
+            "/track_sell &lt;mint&gt; — Start sell tracking\n"
             "/sell_skip — Skip media for last /track_sell\n"
-            "/untrack_sell <mint> — Stop sell tracking\n"
-            "/list_sells — List tracked tokens\n"
-            "/sellthreshold <mint> <usd> — Set whale alert threshold"
+            "/untrack_sell &lt;mint&gt; — Stop sell tracking\n"
+            "/list_sells — List tracked tokens (with whale threshold)\n"
+            "/sellthreshold &lt;mint&gt; &lt;usd&gt; — Set whale alert threshold\n"
         )
     elif section == "x":
         text = (
-            "🐦 X Alerts\n\n"
-            "/x_track <handle> — Track new followers\n"
-            "/x_untrack <handle> — Stop tracking\n"
-            "/x_list — List tracked accounts\n"
-            "/x_debug — Check API status\n"
-            "/x_testuser <handle> — Test lookup\n\n"
-            "Followers are checked every 2 minutes."
+            "<b>🐦 X Alerts</b>\n\n"
+            "/x_track &lt;handle&gt; — Track new followers for an account\n"
+            "/x_untrack &lt;handle&gt; — Stop tracking\n"
+            "/x_list — List tracked X accounts\n"
+            "/x_debug — Check X API token status\n"
+            "/x_testuser &lt;handle&gt; — Test lookup (debug)\n\n"
+            "<i>Followers are checked every 2 minutes.</i>\n"
         )
     else:
-        text = "✨ SentriBot Help\nTap a category below to see commands."
+        text = "<b>✨ SentriBot Help</b>\nTap a category below to see commands."
     return text, kb
 
 async def help_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -168,8 +164,14 @@ async def help_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text, kb = _render_help_section(section)
     try:
         await q.edit_message_text(text=text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        await q.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        logging.warning("help_menu_cb edit failed: %s", e)
+        try:
+            await q.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception as e2:
+            logging.error("help_menu_cb reply failed: %s", e2)
+            # At least tell the user
+            await q.answer("Could not update the menu. Try /help", show_alert=True)
 
 # -------- START / CONTINUE / CONFIG MENU --------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -604,37 +606,27 @@ async def cfgpick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
 
-# -------- SPAM DETECTION (simple & reliable) --------
+# -------- SPAM DETECTION (simple & early) --------
 SPAM_KEYWORDS = os.getenv("SPAM_KEYWORDS", "")
-SPAM_KEYWORDS = [word.strip().lower() for word in SPAM_KEYWORDS.split(",") if word.strip()]
+SPAM_KEYWORDS = [w.strip().lower() for w in SPAM_KEYWORDS.split(",") if w.strip()]
 
 def _spam_text(msg) -> str:
-    # Look at message text OR caption; fall back to empty string
     return (msg.text or msg.caption or "").lower()
 
 async def detect_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not SPAM_KEYWORDS:
         return
-
     text = _spam_text(msg)
-    if text and any(word in text for word in SPAM_KEYWORDS):
+    if text and any(kw in text for kw in SPAM_KEYWORDS):
         chat_id = update.effective_chat.id
-        msg_id = msg.message_id
         user_name = msg.from_user.first_name
-
         try:
-            # Delete the spam message
-            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-
-            # Notify the group
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg.message_id)
             await context.bot.send_message(chat_id=chat_id, text=f"🚫 Spam detected from {user_name}")
-
-            # Warn the user (keeps your warn flow)
             await warn_user(update, context)
         except Exception as e:
-            # Don’t crash the bot if deletion fails (missing permission, etc.)
-            logging.warning("Spam delete failed in chat %s: %s", chat_id, e)
+            logging.warning("Spam delete failed in %s: %s", chat_id, e)
 
 # -------- LOGGING & UTILS --------
 async def log_activity(text):
@@ -734,9 +726,8 @@ def register_moderation(app: Application):
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, goodbye))
 
     # Group text handler first (filters & interactive replies), then spam
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_group_text))
-    app.add_handler(MessageHandler((filters.TEXT | filters.Caption()) & ~filters.COMMAND, detect_spam))
-
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_group_text), group=0)
+    app.add_handler(MessageHandler((filters.TEXT | filters.Caption()) & ~filters.COMMAND, detect_spam), group=-5)
    
     # Membership updates
     app.add_handler(ChatMemberHandler(user_member_update, ChatMemberHandler.CHAT_MEMBER))
