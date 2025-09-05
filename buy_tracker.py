@@ -1,96 +1,131 @@
+# buy_tracker.py
 import os
 import sqlite3
 import logging
+import json
 import aiohttp
+from typing import Dict, Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+)
+from telegram.ext import (
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 
 # ---------------- SETTINGS ----------------
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
+HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
+PUMPFUN_URL = "https://api.pump.fun/v1/token/{}"   # best-effort (may fail)
+ADD_TO_GROUP_URL = (
+    "https://telegram.me/sentrip_bot"
+    "?startgroup=true"
+    "&admin=change_info+delete_messages+ban_users+invite_users+pin_messages"
+)
+
 DB_PATH = "tracked_tokens.db"
 logging.basicConfig(level=logging.INFO)
 
-# Native SOL placeholder (not a real SPL mint)
+DEFAULT_MIN_BUY_USD = 5.0
+DEFAULT_EMOJI = "👀"
+
 NATIVE_SOL_MINTS = {"So11111111111111111111111111111111111111112"}
-def is_native_sol(mint: str) -> bool:
-    return mint in NATIVE_SOL_MINTS
 
-# ---------------- EXTERNAL APIS ----------------
-HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
-COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/solana/contract/{}"
-PUMPFUN_URL = "https://api.pump.fun/v1/token/{}"  # best-effort; may not always be available
 
-# ---------------- DATABASE ----------------
+# ---------------- DB ----------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""
+    c.execute(
+        """
         CREATE TABLE IF NOT EXISTS tracked_tokens (
-            chat_id INTEGER,
-            mint TEXT,
-            media_file_id TEXT,
+            chat_id INTEGER NOT NULL,
+            mint TEXT NOT NULL,
             symbol TEXT,
+            media_file_id TEXT,
+            emoji TEXT,
+            total_supply REAL,
+            min_buy_usd REAL,
+            socials_json TEXT,
+            active INTEGER DEFAULT 0,
             PRIMARY KEY (chat_id, mint)
         )
-    """)
-    # Migration safeguard: add 'symbol' if missing
-    cols = {row[1] for row in c.execute("PRAGMA table_info(tracked_tokens)").fetchall()}
-    if "symbol" not in cols:
-        try:
-            c.execute("ALTER TABLE tracked_tokens ADD COLUMN symbol TEXT")
-        except Exception:
-            pass
-    conn.commit()
-    conn.close()
-
-def add_token(chat_id, mint, media_file_id=None, symbol=None):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "INSERT OR REPLACE INTO tracked_tokens (chat_id, mint, media_file_id, symbol) VALUES (?, ?, ?, ?)",
-        (chat_id, mint, media_file_id, symbol),
+        """
     )
     conn.commit()
     conn.close()
 
-def update_symbol(mint: str, symbol: str):
+
+def upsert_token(
+    chat_id: int,
+    mint: str,
+    **fields,
+):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("UPDATE tracked_tokens SET symbol=? WHERE mint=?", (symbol, mint))
+    # Ensure row exists
+    c.execute(
+        "INSERT OR IGNORE INTO tracked_tokens(chat_id, mint, min_buy_usd) VALUES(?, ?, ?)",
+        (chat_id, mint, DEFAULT_MIN_BUY_USD),
+    )
+    if fields:
+        cols = ", ".join([f"{k}=?" for k in fields.keys()])
+        vals = list(fields.values())
+        vals.extend([chat_id, mint])
+        c.execute(f"UPDATE tracked_tokens SET {cols} WHERE chat_id=? AND mint=?", vals)
     conn.commit()
     conn.close()
 
-def remove_token(chat_id, mint):
+
+def set_active(chat_id: int, mint: str, active: bool):
+    upsert_token(chat_id, mint, active=1 if active else 0)
+
+
+def remove_token(chat_id: int, mint: str):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM tracked_tokens WHERE chat_id=? AND mint=?", (chat_id, mint))
     conn.commit()
     conn.close()
 
-def list_tokens_rows(chat_id):
+
+def list_tokens_rows(chat_id: int):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT mint, media_file_id, symbol FROM tracked_tokens WHERE chat_id=?", (chat_id,))
+    c.execute(
+        "SELECT mint, symbol, media_file_id, emoji, total_supply, min_buy_usd, socials_json, active FROM tracked_tokens WHERE chat_id=?",
+        (chat_id,),
+    )
     rows = c.fetchall()
     conn.close()
     return rows
 
-# ---------------- HELPERS ----------------
-def fmt_num(x):
-    try:
-        n = float(x or 0)
-        return f"{n:,.0f}"
-    except Exception:
-        return str(x)
 
-def fmt_price(x):
-    try:
-        n = float(x or 0)
-        return f"{n:.8f}" if n < 1 else f"{n:.4f}"
-    except Exception:
-        return str(x)
+def get_token_row(chat_id: int, mint: str) -> Optional[tuple]:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT mint, symbol, media_file_id, emoji, total_supply, min_buy_usd, socials_json, active FROM tracked_tokens WHERE chat_id=? AND mint=?",
+        (chat_id, mint),
+    )
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+# ---------------- HELPERS ----------------
+def is_native_sol(mint: str) -> bool:
+    return mint in NATIVE_SOL_MINTS
+
 
 def fmt_amount(x):
     try:
@@ -105,6 +140,7 @@ def fmt_amount(x):
     except Exception:
         return str(x)
 
+
 def fmt_usd(x):
     try:
         n = float(x or 0)
@@ -112,101 +148,20 @@ def fmt_usd(x):
     except Exception:
         return f"${x}"
 
+
 def short_wallet(addr: str) -> str:
     if not addr or len(addr) < 8:
         return addr or "?"
     return addr[:4] + "..." + addr[-4:]
+
 
 def short_mint(mint: str) -> str:
     if not mint or len(mint) <= 10:
         return mint or "?"
     return mint[:4] + "…" + mint[-4:]
 
-# ---------------- BUYTRACKER LOGIC ----------------
-pending_media = {}
-last_seen = {}  # mint -> last seen tx signature
 
-async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ Usage: /track <mint>")
-        return
-    mint = context.args[0].strip()
-    chat_id = update.effective_chat.id
-
-    if is_native_sol(mint):
-        await update.message.reply_text(
-            "⚠️ Native SOL isn’t an SPL mint. This tracker watches SPL token mints (e.g., pump.fun tokens). "
-            "Please /track a token mint address instead."
-        )
-        return
-
-    symbol = await best_symbol_for_mint(mint)
-    pending_media[chat_id] = mint
-    add_token(chat_id, mint, None, symbol)
-    await update.message.reply_text(
-        f"✅ Tracking {mint} ({symbol or 'TOKEN'}). Send an image now or /skip."
-    )
-
-async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if chat_id in pending_media:
-        del pending_media[chat_id]
-        await update.message.reply_text("✅ Skipped media.")
-    else:
-        await update.message.reply_text("❌ No pending token.")
-
-async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if chat_id not in pending_media:
-        return
-    mint = pending_media.pop(chat_id)
-    if update.message.photo:
-        file_id = update.message.photo[-1].file_id
-    elif update.message.document:
-        file_id = update.message.document.file_id
-    else:
-        return
-    add_token(chat_id, mint, file_id, None)  # keep symbol if already set
-    await update.message.reply_text(f"📸 Media saved for {mint}.")
-
-async def cmd_untrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ Usage: /untrack <mint>")
-        return
-    mint = context.args[0].strip()
-    chat_id = update.effective_chat.id
-    remove_token(chat_id, mint)
-    await update.message.reply_text(f"🗑 Stopped tracking {mint}.")
-
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    rows = list_tokens_rows(chat_id)
-    if not rows:
-        await update.message.reply_text("No tokens tracked.")
-        return
-
-    enriched = []
-    for mint, _media, symbol in rows:
-        if not symbol:
-            symbol = await best_symbol_for_mint(mint)
-            if symbol:
-                update_symbol(mint, symbol)
-        enriched.append((symbol or "TOKEN", mint))
-
-    enriched.sort(key=lambda t: t[0].upper())
-
-    lines = []
-    for symbol, mint in enriched:
-        link = f"https://solscan.io/token/{mint}"
-        lines.append(f"• {symbol} — [{short_mint(mint)}]({link})")
-
-    await update.message.reply_text(
-        "📋 Tracked tokens:\n" + "\n".join(lines),
-        disable_web_page_preview=True,
-        parse_mode="Markdown"
-    )
-
-# ---------------- CORE RPC ----------------
+# ---------------- EXTERNAL LOOKUPS ----------------
 async def fetch_transactions(mint: str, limit: int = 5):
     payload = {
         "jsonrpc": "2.0",
@@ -218,6 +173,7 @@ async def fetch_transactions(mint: str, limit: int = 5):
         async with session.post(HELIUS_URL, json=payload) as resp:
             data = await resp.json()
             return data.get("result", [])
+
 
 async def get_transaction(signature: str):
     payload = {
@@ -231,7 +187,7 @@ async def get_transaction(signature: str):
             data = await resp.json()
             return data.get("result")
 
-# ---------------- BUY PARSER ----------------
+
 async def parse_buy(signature: str, mint: str):
     tx = await get_transaction(signature)
     if not tx:
@@ -262,9 +218,9 @@ async def parse_buy(signature: str, mint: str):
             return {"buyer": b.get("owner"), "amount": tokens, "decimals": dec}
     return None
 
-# ---------------- TOKEN INFO + SYMBOL HELPERS ----------------
+
 async def fetch_token_info(mint: str):
-    # 1) Pump.fun (best effort)
+    # 1) Pump.fun
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(PUMPFUN_URL.format(mint)) as resp:
@@ -276,11 +232,12 @@ async def fetch_token_info(mint: str):
                             "symbol": d.get("symbol", "TOKEN"),
                             "price": float(d.get("price", 0) or 0),
                             "mc": float(d.get("marketCap", 0) or 0),
+                            "name": d.get("name") or d.get("symbol") or "TOKEN",
                         }
     except Exception:
         pass
 
-    # 2) DexScreener (prefer FDV as MC proxy)
+    # 2) DexScreener
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(DEXSCREENER_URL.format(mint)) as resp:
@@ -291,29 +248,17 @@ async def fetch_token_info(mint: str):
                         pair = pairs[0]
                         price_usd = float(pair.get("priceUsd", 0) or 0)
                         fdv = float(pair.get("fdv", 0) or 0)
-                        symbol = (pair.get("baseToken") or {}).get("symbol", "TOKEN")
-                        return {"symbol": symbol, "price": price_usd, "mc": fdv}
+                        base = (pair.get("baseToken") or {})
+                        symbol = base.get("symbol", "TOKEN")
+                        name = base.get("name") or symbol or "TOKEN"
+                        return {"symbol": symbol, "price": price_usd, "mc": fdv, "name": name}
     except Exception:
         pass
 
-    # 3) CoinGecko
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(COINGECKO_URL.format(mint)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    market_data = data.get("market_data") or {}
-                    return {
-                        "symbol": (data.get("symbol") or "TOKEN").upper(),
-                        "price": float(((market_data.get("current_price") or {}).get("usd", 0)) or 0),
-                        "mc": float(((market_data.get("market_cap") or {}).get("usd", 0)) or 0),
-                    }
-    except Exception:
-        pass
+    return {"symbol": "TOKEN", "price": 0, "mc": 0, "name": "TOKEN"}
 
-    return {"symbol": "TOKEN", "price": 0, "mc": 0}
 
-async def best_symbol_for_mint(mint: str):
+async def best_symbol_for_mint(mint: str) -> Optional[str]:
     try:
         info = await fetch_token_info(mint)
         sym = (info.get("symbol") or "").strip()
@@ -321,40 +266,34 @@ async def best_symbol_for_mint(mint: str):
     except Exception:
         return None
 
+
 # ---------------- POLLING ----------------
+last_seen: Dict[str, str] = {}  # mint -> last signature
+
+
 async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT chat_id, mint, media_file_id, symbol FROM tracked_tokens")
+    c.execute("SELECT chat_id, mint, media_file_id, symbol, emoji, min_buy_usd, socials_json, active FROM tracked_tokens WHERE active=1")
     rows = c.fetchall()
     conn.close()
 
-    for chat_id, mint, media_file_id, symbol in rows:
-        # Skip native SOL
+    for chat_id, mint, media_file_id, symbol, emoji, min_buy_usd, socials_json, active in rows:
         if is_native_sol(mint):
             continue
-
         try:
             txs = await fetch_transactions(mint, limit=5)
             if not txs:
                 continue
-
             sig = txs[0].get("signature")
             if not sig or last_seen.get(mint) == sig:
                 continue
+            last_seen[mint] = sig  # prevent dupes
 
-            last_seen[mint] = sig  # set early to avoid duplicates
-
-            # Ensure symbol cached
-            if not symbol:
-                symbol = await best_symbol_for_mint(mint)
-                if symbol:
-                    update_symbol(mint, symbol)
-
+            # Ensure token info
             token_info = await fetch_token_info(mint)
-            disp_symbol = symbol or token_info.get("symbol", "TOKEN")
-            price = float(token_info.get("price", 0) or 0)
-            mcap = float(token_info.get("mc", 0) or 0)
+            if not symbol:
+                symbol = token_info.get("symbol") or "TOKEN"
 
             details = await parse_buy(sig, mint)
             if not details:
@@ -362,58 +301,401 @@ async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
 
             amount = float(details.get("amount", 0) or 0)
             buyer = details.get("buyer") or "?"
+            price = float(token_info.get("price", 0) or 0)
+            mcap = float(token_info.get("mc", 0) or 0)
             usd_value = amount * price if price else 0.0
 
-            # ---------- Styled alert ----------
-            skulls = "💀" * 14
-            title = f"{disp_symbol} [{disp_symbol}] 💀Buy!"
+            # Min buy filter
+            threshold = float(min_buy_usd or DEFAULT_MIN_BUY_USD)
+            if usd_value < threshold:
+                continue
+
+            # Socials
+            socials_txt = ""
+            try:
+                soc = json.loads(socials_json) if socials_json else {}
+                parts = []
+                if soc.get("x"): parts.append(f"[X]({soc['x']})")
+                if soc.get("instagram"): parts.append(f"[IG]({soc['instagram']})")
+                if soc.get("website"): parts.append(f"[Web]({soc['website']})")
+                if parts:
+                    socials_txt = " " + " • ".join(parts)
+            except Exception:
+                pass
+
+            # Compose alert
+            chosen_emoji = (emoji or DEFAULT_EMOJI)
             tx_url = f"https://solscan.io/tx/{sig}"
             buyer_url = f"https://solscan.io/account/{buyer}" if buyer else tx_url
-
-            text = (
-                f"{title}\n\n"
-                f"{skulls}\n\n"
-                f"💀| {fmt_usd(usd_value)}\n"
-                f"💀| Got: {fmt_amount(amount)} {disp_symbol}\n"
-                f"💀| [Buyer]({buyer_url}) | [Txn]({tx_url})\n"
-                f"💀| Position: New\n"
-                f"💀| Market Cap: {fmt_usd(mcap)}\n"
-            )
-
-            # ---------- Buttons ----------
             jup = f"https://jup.ag/swap/SOL-{mint}"
             dexs = f"https://dexscreener.com/solana/{mint}"
-            twitter = "https://x.com/sentrip_bot"
-            boost_url = "https://t.me/"
+
+            title = f"{chosen_emoji} | {symbol} BUY!"
+            body = (
+                f"🔷 SOL {fmt_amount(usd_value/price) if price else '—'} ({fmt_usd(usd_value)})\n"
+                f"🪙 {symbol} {fmt_amount(amount)}\n"
+                f"🔎 Position: New Holder [{short_wallet(buyer)}]({buyer_url})\n"
+                f"📈 MCap: {fmt_usd(mcap)}{socials_txt}\n"
+                f"[Tx]({tx_url})"
+            )
+            text = f"{title}\n{body}"
 
             buttons = [
-                [
-                    InlineKeyboardButton("🐴 Buy", url=jup),
-                    InlineKeyboardButton("💀 DexS", url=dexs),
-                    InlineKeyboardButton("💀 Twitter", url=twitter),
-                    InlineKeyboardButton("⚡️ Boost with Odin", url=boost_url),
-                ],
-                [
-                    InlineKeyboardButton("Buyer", url=buyer_url),
-                    InlineKeyboardButton("Txn", url=tx_url),
-                ],
+                [InlineKeyboardButton("📊 Dex", url=dexs), InlineKeyboardButton("💲 Buy", url=jup)],
+                [InlineKeyboardButton("Wallet", url=buyer_url), InlineKeyboardButton("Txn", url=tx_url)],
             ]
             markup = InlineKeyboardMarkup(buttons)
 
             if media_file_id:
-                await context.bot.send_photo(chat_id, photo=media_file_id, caption=text, reply_markup=markup, parse_mode="Markdown", disable_web_page_preview=True)
+                # Try sending as photo; if it fails, fallback to message
+                try:
+                    await context.bot.send_photo(
+                        chat_id,
+                        photo=media_file_id,
+                        caption=text,
+                        reply_markup=markup,
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    await context.bot.send_message(
+                        chat_id, text, reply_markup=markup, parse_mode="Markdown", disable_web_page_preview=True
+                    )
             else:
-                await context.bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown", disable_web_page_preview=True)
+                await context.bot.send_message(
+                    chat_id, text, reply_markup=markup, parse_mode="Markdown", disable_web_page_preview=True
+                )
 
         except Exception as e:
             logging.error(f"Error polling {mint}: {e}")
 
+
+# ---------------- DM FLOW STATE ----------------
+# user_id -> dict(stage, origin_chat_id, mint, tmp_fields)
+PENDING_DM: Dict[int, Dict] = {}
+
+
+def _settings_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("😀 Emoji", callback_data="bt:set:emoji")],
+        [InlineKeyboardButton("📦 Total Supply", callback_data="bt:set:supply")],
+        [InlineKeyboardButton("💵 Min Buy ($)", callback_data="bt:set:minbuy")],
+        [InlineKeyboardButton("🖼️ Media", callback_data="bt:set:media")],
+        [InlineKeyboardButton("🔗 Socials", callback_data="bt:set:socials")],
+        [InlineKeyboardButton("🗑 Delete Token", callback_data="bt:set:delete")],
+        [InlineKeyboardButton("✅ Done / Activate", callback_data="bt:set:done")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+# ---------------- COMMANDS (GROUP → DM DEEPLINK) ----------------
+async def cmd_track_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Group: /track → DM deep-link."""
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Use /track inside a group to configure via DM.")
+        return
+    deep = f"https://t.me/sentrip_bot?start=track_{chat.id}"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Open DM to set up Buy Tracker", url=deep)]])
+    await update.message.reply_text(
+        "I’ll guide you in DM to set this up for this group.",
+        reply_markup=kb
+    )
+
+
+# ---------------- DM ENTRY VIA /start ----------------
+async def start_buy_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """DM-only /start payload: track_<chat_id> → ask for mint."""
+    chat = update.effective_chat
+    if chat.type != "private":
+        return  # ignore groups here
+
+    args = context.args or []
+    if not args or not args[0].startswith("track_"):
+        return  # not our payload; let your main /start handler respond
+
+    try:
+        origin_chat_id = int(args[0].split("_", 1)[1])
+    except Exception:
+        await update.message.reply_text("Invalid link. Please try /track again in your group.")
+        return
+
+    uid = update.effective_user.id
+    PENDING_DM[uid] = {"stage": "ask_mint", "origin_chat_id": origin_chat_id, "mint": None, "tmp": {}}
+
+    await update.message.reply_text(
+        "🧭 Send the <b>mint address</b> you want to track.",
+        parse_mode="HTML"
+    )
+
+
+# ---------------- DM TEXT HANDLER ----------------
+async def dm_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.message
+    if chat.type != "private" or not msg or not msg.text:
+        return
+
+    uid = update.effective_user.id
+    state = PENDING_DM.get(uid)
+    if not state:
+        # Not in a buy setup flow; ignore (your main /start will handle)
+        return
+
+    stage = state.get("stage")
+    origin = state.get("origin_chat_id")
+
+    # Disallow commands inside the flow
+    if msg.text.strip().startswith("/"):
+        await msg.reply_text("Please send text (no /commands) while configuring.")
+        return
+
+    if stage == "ask_mint":
+        mint = msg.text.strip()
+        if is_native_sol(mint):
+            await msg.reply_text("⚠️ Native SOL isn’t an SPL mint. Send a token mint address.")
+            return
+        # Fake “suggestions”: show the provided mint with symbol lookup
+        info = await fetch_token_info(mint)
+        symbol = info.get("symbol") or "TOKEN"
+        name = info.get("name") or symbol
+        state["mint"] = mint
+        # store basic defaults immediately
+        upsert_token(origin, mint, symbol=symbol, min_buy_usd=DEFAULT_MIN_BUY_USD)
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(f"✅ {name} ({symbol}) — {short_mint(mint)}", callback_data=f"bt:confirm:{mint}")],
+                [InlineKeyboardButton("↩️ Send another mint", callback_data="bt:again")],
+            ]
+        )
+        await msg.reply_text(
+            f"I found: <b>{name}</b> (<b>{symbol}</b>) for <code>{short_mint(mint)}</code>\nConfirm this token?",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        state["stage"] = "confirming"
+        return
+
+    # Settings sub-states handled by callback + this text router
+    if stage == "set_emoji":
+        emoji = msg.text.strip()
+        upsert_token(origin, state["mint"], emoji=emoji)
+        await msg.reply_text(f"Emoji set to {emoji}")
+        state["stage"] = "settings"
+        await msg.reply_text("🛠 Buy Bot Settings:", reply_markup=_settings_keyboard())
+        return
+
+    if stage == "set_supply":
+        try:
+            supply = float(msg.text.strip().replace(",", ""))
+            upsert_token(origin, state["mint"], total_supply=supply)
+            await msg.reply_text(f"Total supply set to {supply:,.0f}")
+        except Exception:
+            await msg.reply_text("Please send a number (e.g., 1_000_000_000).")
+            return
+        state["stage"] = "settings"
+        await msg.reply_text("🛠 Buy Bot Settings:", reply_markup=_settings_keyboard())
+        return
+
+    if stage == "set_minbuy":
+        try:
+            mb = float(msg.text.strip().replace("$", "").replace(",", ""))
+            upsert_token(origin, state["mint"], min_buy_usd=mb)
+            await msg.reply_text(f"Min buy set to ${mb:,.2f}")
+        except Exception:
+            await msg.reply_text("Send a dollar amount (e.g., 5 or 12.5).")
+            return
+        state["stage"] = "settings"
+        await msg.reply_text("🛠 Buy Bot Settings:", reply_markup=_settings_keyboard())
+        return
+
+    if stage == "set_socials":
+        # Expect JSON-ish or simple lines; we’ll accept simple key:value pairs
+        # Example: x:https://x.com/your, instagram:https://instagram.com/your
+        text = msg.text.strip()
+        data = {}
+        try:
+            if text.startswith("{"):
+                data = json.loads(text)
+            else:
+                for part in text.splitlines():
+                    if ":" in part:
+                        k, v = part.split(":", 1)
+                        data[k.strip().lower()] = v.strip()
+        except Exception:
+            await msg.reply_text("Send socials as key:value lines or a small JSON object.")
+            return
+        upsert_token(origin, state["mint"], socials_json=json.dumps(data))
+        await msg.reply_text("Socials updated.")
+        state["stage"] = "settings"
+        await msg.reply_text("🛠 Buy Bot Settings:", reply_markup=_settings_keyboard())
+        return
+
+
+# ---------------- DM MEDIA HANDLER (for media setting) ----------------
+async def dm_media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.message
+    if chat.type != "private" or not msg:
+        return
+    uid = update.effective_user.id
+    state = PENDING_DM.get(uid)
+    if not state or state.get("stage") != "set_media":
+        return
+
+    origin = state["origin_chat_id"]
+    mint = state["mint"]
+
+    file_id = None
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+    elif msg.video:
+        file_id = msg.video.file_id
+    elif msg.document and (msg.document.mime_type or "").startswith(("image/", "video/")):
+        file_id = msg.document.file_id
+
+    if not file_id:
+        await msg.reply_text("Please send an image or video.")
+        return
+
+    upsert_token(origin, mint, media_file_id=file_id)
+    await msg.reply_text("Media saved.")
+    state["stage"] = "settings"
+    await msg.reply_text("🛠 Buy Bot Settings:", reply_markup=_settings_keyboard())
+
+
+# ---------------- CALLBACKS (CONFIRM & SETTINGS) ----------------
+async def bt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    uid = q.from_user.id
+    state = PENDING_DM.get(uid)
+    if not state:
+        return
+
+    origin = state["origin_chat_id"]
+    mint = state.get("mint")
+
+    if data == "bt:again":
+        state["stage"] = "ask_mint"
+        await q.message.reply_text("Okay, send the mint address again.")
+        return
+
+    if data.startswith("bt:confirm:"):
+        # Confirmed the mint — show settings
+        state["stage"] = "settings"
+        await q.message.reply_text("⚙️ Choose from the following options to customize your Buy Bot:", reply_markup=_settings_keyboard())
+        return
+
+    if data == "bt:set:emoji":
+        state["stage"] = "set_emoji"
+        await q.message.reply_text("Send the emoji you want to use.")
+        return
+
+    if data == "bt:set:supply":
+        state["stage"] = "set_supply"
+        await q.message.reply_text("Send the total supply (number).")
+        return
+
+    if data == "bt:set:minbuy":
+        state["stage"] = "set_minbuy"
+        await q.message.reply_text(f"Send the minimum buy in USD (default {DEFAULT_MIN_BUY_USD}).")
+        return
+
+    if data == "bt:set:media":
+        state["stage"] = "set_media"
+        await q.message.reply_text("Send an image or video to attach to every alert.")
+        return
+
+    if data == "bt:set:socials":
+        state["stage"] = "set_socials"
+        await q.message.reply_text(
+            "Send your socials as key:value on separate lines, e.g.\n"
+            "x:https://x.com/your\ninstagram:https://instagram.com/your\nwebsite:https://yoursite.xyz"
+        )
+        return
+
+    if data == "bt:set:delete":
+        if mint:
+            remove_token(origin, mint)
+        await q.message.reply_text("Token deleted from tracking.")
+        # end the flow
+        PENDING_DM.pop(uid, None)
+        return
+
+    if data == "bt:set:done":
+        # Activate & announce in group
+        if not mint:
+            await q.message.reply_text("Missing token context. Please start over with /track in your group.")
+            PENDING_DM.pop(uid, None)
+            return
+        set_active(origin, mint, True)
+        # Fetch symbol for nicer message
+        row = get_token_row(origin, mint)
+        symbol = (row[1] if row else None) or (await best_symbol_for_mint(mint) or "TOKEN")
+        try:
+            await context.bot.send_message(
+                origin,
+                f"✅ SentriBot Buy Tracker has been successfully activated!\nTracking <b>{symbol}</b> (<code>{short_mint(mint)}</code>).",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        await q.message.reply_text("All set! Alerts will post in your group when buys meet your settings.")
+        PENDING_DM.pop(uid, None)
+        return
+
+
+# ---------------- LEGACY COMMANDS (OPTIONAL) ----------------
+async def cmd_untrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Usage: /untrack <mint>")
+        return
+    mint = context.args[0].strip()
+    chat_id = update.effective_chat.id
+    remove_token(chat_id, mint)
+    await update.message.reply_text(f"🗑 Stopped tracking {short_mint(mint)}.")
+
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    rows = list_tokens_rows(chat_id)
+    if not rows:
+        await update.message.reply_text("No tokens tracked.")
+        return
+
+    lines = []
+    for (mint, symbol, media_file_id, emoji, supply, min_buy, socials_json, active) in rows:
+        status = "ON" if active else "OFF"
+        symbol = symbol or "TOKEN"
+        link = f"https://solscan.io/token/{mint}"
+        lines.append(f"• {symbol} — [{short_mint(mint)}]({link}) — min ${min_buy or DEFAULT_MIN_BUY_USD:.2f} — {status}")
+
+    await update.message.reply_text(
+        "📋 Tracked tokens:\n" + "\n".join(lines),
+        disable_web_page_preview=True,
+        parse_mode="Markdown"
+    )
+
+
 # ---------------- REGISTER ----------------
 def register_buytracker(app):
     init_db()
-    app.add_handler(CommandHandler("track", cmd_track))
-    app.add_handler(CommandHandler("skip", cmd_skip))
+    # GROUP command to kick off DM flow
+    app.add_handler(CommandHandler("track", cmd_track_group, filters.ChatType.GROUPS))
+
+    # DM entry via /start track_<chat_id>
+    app.add_handler(CommandHandler("start", start_buy_dm, filters.ChatType.PRIVATE))
+
+    # DM callbacks & text/media during configuration
+    app.add_handler(CallbackQueryHandler(bt_callback, pattern=r"^bt:(confirm|again|set:.*)", block=False))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, dm_text_router))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.PHOTO | filters.VIDEO | filters.Document.ALL), dm_media_router))
+
+    # Optional legacy group utilities
     app.add_handler(CommandHandler("untrack", cmd_untrack))
     app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_media))
+
+    # Poller
     app.job_queue.run_repeating(poll_tracked, interval=30, first=5)
