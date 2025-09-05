@@ -16,6 +16,7 @@ from telegram.ext import (
     ChatMemberHandler,
     CallbackQueryHandler,
     ContextTypes,
+    ApplicationHandlerStop,  # <-- ADDED
     filters,
 )
 
@@ -545,6 +546,39 @@ async def handle_dm_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             PENDING_RULES_DM.pop(user.id, None)
         return
 
+# -------- HIGH-PRIORITY DM GATE (new) --------
+async def dm_pending_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Intercept DM while we're waiting for welcome/rules text, and block others."""
+    chat = update.effective_chat
+    msg  = update.message
+    if not chat or chat.type != "private" or not msg or not msg.text:
+        return  # not our case
+
+    uid = update.effective_user.id
+    pending = (uid in PENDING_WELCOME_DM) or (uid in PENDING_RULES_DM)
+    if not pending:
+        return  # let other handlers process normally
+
+    # Guard against commands/forwards in DM while pending
+    if any(e.type == "bot_command" for e in (msg.entities or [])) or msg.text.strip().startswith("/"):
+        await msg.reply_text("Please send the text only (no /commands).")
+        raise ApplicationHandlerStop
+
+    if getattr(msg, "forward_origin", None) or getattr(msg, "forward_date", None) or getattr(msg, "forward_from_chat", None):
+        await msg.reply_text("Please type the message — don’t forward/quote.")
+        raise ApplicationHandlerStop
+
+    # Route straight to the saver and block others
+    await handle_dm_text(update, context)
+    raise ApplicationHandlerStop
+
+# Optional exit for DM flow
+async def cancel_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    PENDING_WELCOME_DM.pop(uid, None)
+    PENDING_RULES_DM.pop(uid, None)
+    await update.message.reply_text("✖️ Cancelled. No changes saved.")
+
 # -------- Config pick & menu callbacks (DM) --------
 async def cfgpick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -706,5 +740,12 @@ def register_moderation(app: Application):
     app.add_handler(ChatMemberHandler(user_member_update, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(my_bot_member_update, ChatMemberHandler.MY_CHAT_MEMBER))
 
-    # DM text capture
+    # ===== HIGH-PRIORITY DM GATE & CANCEL (NEW) =====
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, dm_pending_gate),
+        group=-100,  # run first, stop others if pending
+    )
+    app.add_handler(CommandHandler("cancel", cancel_dm))
+
+    # DM text capture (normal DM traffic that isn't pending)
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, handle_dm_text))
