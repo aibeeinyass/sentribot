@@ -4,6 +4,9 @@ import sqlite3
 import logging
 import json
 import aiohttp
+import time
+import secrets
+import re
 from typing import Dict, Optional
 
 from telegram import (
@@ -19,7 +22,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
-    ApplicationHandlerStop,   # <-- added
+    ApplicationHandlerStop,   # safe to keep; used nowhere now but fine
 )
 
 # ---------------- SETTINGS ----------------
@@ -39,8 +42,39 @@ logging.basicConfig(level=logging.INFO)
 DEFAULT_MIN_BUY_USD = 5.0
 DEFAULT_EMOJI = "👀"
 
+PAIR_CODE_TTL_SEC = 10 * 60  # 10 minutes
+
 NATIVE_SOL_MINTS = {"So11111111111111111111111111111111111111112"}
 
+# ---------------- PAIRING CODES (Group → DM) ----------------
+# code -> {"origin_chat_id": int, "user_id": int, "ts": float}
+PAIR_CODES: Dict[str, Dict] = {}
+
+def _gen_pair_code() -> str:
+    # 6-digit numeric, avoid collisions
+    for _ in range(20):
+        code = f"{secrets.randbelow(900000) + 100000}"
+        if code not in PAIR_CODES:
+            return code
+    # very unlikely fallback
+    return f"{secrets.randbelow(900000) + 100000}"
+
+def _put_code(code: str, origin_chat_id: int, user_id: int):
+    PAIR_CODES[code] = {"origin_chat_id": origin_chat_id, "user_id": user_id, "ts": time.time()}
+
+def _pop_valid_code(code: str, user_id: int) -> Optional[int]:
+    data = PAIR_CODES.get(code)
+    if not data:
+        return None
+    # expire old
+    if time.time() - data["ts"] > PAIR_CODE_TTL_SEC:
+        PAIR_CODES.pop(code, None)
+        return None
+    # bind to the same user who initiated in group (prevents hijack)
+    if data["user_id"] != user_id:
+        return None
+    PAIR_CODES.pop(code, None)
+    return int(data["origin_chat_id"])
 
 # ---------------- DB ----------------
 def init_db():
@@ -65,7 +99,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-
 def upsert_token(
     chat_id: int,
     mint: str,
@@ -86,10 +119,8 @@ def upsert_token(
     conn.commit()
     conn.close()
 
-
 def set_active(chat_id: int, mint: str, active: bool):
     upsert_token(chat_id, mint, active=1 if active else 0)
-
 
 def remove_token(chat_id: int, mint: str):
     conn = sqlite3.connect(DB_PATH)
@@ -97,7 +128,6 @@ def remove_token(chat_id: int, mint: str):
     c.execute("DELETE FROM tracked_tokens WHERE chat_id=? AND mint=?", (chat_id, mint))
     conn.commit()
     conn.close()
-
 
 def list_tokens_rows(chat_id: int):
     conn = sqlite3.connect(DB_PATH)
@@ -110,7 +140,6 @@ def list_tokens_rows(chat_id: int):
     conn.close()
     return rows
 
-
 def get_token_row(chat_id: int, mint: str) -> Optional[tuple]:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -122,11 +151,9 @@ def get_token_row(chat_id: int, mint: str) -> Optional[tuple]:
     conn.close()
     return row
 
-
 # ---------------- HELPERS ----------------
 def is_native_sol(mint: str) -> bool:
     return mint in NATIVE_SOL_MINTS
-
 
 def fmt_amount(x):
     try:
@@ -141,7 +168,6 @@ def fmt_amount(x):
     except Exception:
         return str(x)
 
-
 def fmt_usd(x):
     try:
         n = float(x or 0)
@@ -149,18 +175,15 @@ def fmt_usd(x):
     except Exception:
         return f"${x}"
 
-
 def short_wallet(addr: str) -> str:
     if not addr or len(addr) < 8:
         return addr or "?"
     return addr[:4] + "..." + addr[-4:]
 
-
 def short_mint(mint: str) -> str:
     if not mint or len(mint) <= 10:
         return mint or "?"
     return mint[:4] + "…" + mint[-4:]
-
 
 # ---------------- EXTERNAL LOOKUPS ----------------
 async def fetch_transactions(mint: str, limit: int = 5):
@@ -175,7 +198,6 @@ async def fetch_transactions(mint: str, limit: int = 5):
             data = await resp.json()
             return data.get("result", [])
 
-
 async def get_transaction(signature: str):
     payload = {
         "jsonrpc": "2.0",
@@ -187,7 +209,6 @@ async def get_transaction(signature: str):
         async with session.post(HELIUS_URL, json=payload) as resp:
             data = await resp.json()
             return data.get("result")
-
 
 async def parse_buy(signature: str, mint: str):
     tx = await get_transaction(signature)
@@ -218,7 +239,6 @@ async def parse_buy(signature: str, mint: str):
             tokens = delta / (10 ** max(dec, 0))
             return {"buyer": b.get("owner"), "amount": tokens, "decimals": dec}
     return None
-
 
 async def fetch_token_info(mint: str):
     # 1) Pump.fun
@@ -258,7 +278,6 @@ async def fetch_token_info(mint: str):
 
     return {"symbol": "TOKEN", "price": 0, "mc": 0, "name": "TOKEN"}
 
-
 async def best_symbol_for_mint(mint: str) -> Optional[str]:
     try:
         info = await fetch_token_info(mint)
@@ -267,10 +286,8 @@ async def best_symbol_for_mint(mint: str) -> Optional[str]:
     except Exception:
         return None
 
-
 # ---------------- POLLING ----------------
 last_seen: Dict[str, str] = {}  # mint -> last signature
-
 
 async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_PATH)
@@ -370,11 +387,9 @@ async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"Error polling {mint}: {e}")
 
-
 # ---------------- DM FLOW STATE ----------------
 # user_id -> dict(stage, origin_chat_id, mint, tmp_fields)
 PENDING_DM: Dict[int, Dict] = {}
-
 
 def _settings_keyboard() -> InlineKeyboardMarkup:
     rows = [
@@ -388,55 +403,55 @@ def _settings_keyboard() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(rows)
 
-
-# ---------------- COMMANDS (GROUP → DM DEEPLINK) ----------------
+# ---------------- COMMANDS (GROUP → PAIRING CODE) ----------------
 async def cmd_track_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Group: /track → DM deep-link."""
+    """Group: /track → show pairing code + plain DM link."""
     chat = update.effective_chat
+    user = update.effective_user
     if chat.type not in ("group", "supergroup"):
         await update.message.reply_text("Use /track inside a group to configure via DM.")
         return
 
     me = await context.bot.get_me()
-    deep = f"https://t.me/sentrip_bot?start=track_{chat.id}"
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Open DM to set up Buy Tracker", url=deep)]])
+    code = _gen_pair_code()
+    _put_code(code, origin_chat_id=chat.id, user_id=user.id)
+
+    dm_url = f"https://t.me/{me.username}"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Open DM with SentriBot", url=dm_url)]])
     await update.message.reply_text(
-        "I’ll guide you in DM to set this up for this group.",
-        reply_markup=kb
+        "I’ll guide you in DM to set this up for this group.\n\n"
+        f"🔐 Pairing code: <code>{code}</code>\n"
+        "➡️ In DM, send exactly: <b>track " + code + "</b>\n"
+        "<i>(Code expires in 10 minutes and only works for you.)</i>",
+        reply_markup=kb,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
     )
 
+# ---------------- DM ENTRY via "track <code>" (NO /start) ----------------
+PAIR_RX = re.compile(r"^\s*track\s+(\d{6})\s*$", re.IGNORECASE)
 
-# ---------------- DM ENTRY VIA /start ----------------
-async def start_buy_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """DM-only /start payload: track_<chat_id> → ask for mint.
-       If we handle it, STOP propagation so moderation.py's intro doesn't run.
-    """
+async def dm_entry_by_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """DM-only: user sends 'track 123456' to begin the wizard."""
     chat = update.effective_chat
-    if chat.type != "private":
-        return  # ignore groups here
+    msg = update.message
+    if chat.type != "private" or not msg or not msg.text:
+        return
 
-    args = context.args or []
-    if not args or not args[0].startswith("track_"):
-        return  # not our payload; let your main /start handler respond
-
-    try:
-        origin_chat_id = int(args[0].split("_", 1)[1])
-    except Exception:
-        await update.message.reply_text("Invalid link. Please try /track again in your group.")
-        # we handled this /start; stop others
-        raise ApplicationHandlerStop
+    m = PAIR_RX.match(msg.text)
+    if not m:
+        return  # not our trigger
 
     uid = update.effective_user.id
+    code = m.group(1)
+    origin_chat_id = _pop_valid_code(code, uid)
+    if not origin_chat_id:
+        await msg.reply_text("❌ Invalid or expired code. Go back to your group and run /track again.")
+        return
+
+    # Start the wizard
     PENDING_DM[uid] = {"stage": "ask_mint", "origin_chat_id": origin_chat_id, "mint": None, "tmp": {}}
-
-    await update.message.reply_text(
-        "🧭 Send the <b>mint address</b> you want to track.",
-        parse_mode="HTML"
-    )
-
-    # We’ve handled the deep-link. Prevent moderation.py’s /start from sending the intro.
-    raise ApplicationHandlerStop
-
+    await msg.reply_text("🧭 Send the <b>mint address</b> you want to track.", parse_mode="HTML")
 
 # ---------------- DM TEXT HANDLER ----------------
 async def dm_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -448,8 +463,7 @@ async def dm_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     state = PENDING_DM.get(uid)
     if not state:
-        # Not in a buy setup flow; ignore (your main /start will handle)
-        return
+        return  # not in the flow
 
     stage = state.get("stage")
     origin = state.get("origin_chat_id")
@@ -464,7 +478,6 @@ async def dm_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_native_sol(mint):
             await msg.reply_text("⚠️ Native SOL isn’t an SPL mint. Send a token mint address.")
             return
-        # Fake “suggestions”: show the provided mint with symbol lookup
         info = await fetch_token_info(mint)
         symbol = info.get("symbol") or "TOKEN"
         name = info.get("name") or symbol
@@ -519,8 +532,7 @@ async def dm_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if stage == "set_socials":
-        # Expect JSON-ish or simple lines; we’ll accept simple key:value pairs
-        # Example: x:https://x.com/your, instagram:https://instagram.com/your
+        # Accept key:value lines or JSON
         text = msg.text.strip()
         data = {}
         try:
@@ -539,7 +551,6 @@ async def dm_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["stage"] = "settings"
         await msg.reply_text("🛠 Buy Bot Settings:", reply_markup=_settings_keyboard())
         return
-
 
 # ---------------- DM MEDIA HANDLER (for media setting) ----------------
 async def dm_media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -571,7 +582,6 @@ async def dm_media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text("Media saved.")
     state["stage"] = "settings"
     await msg.reply_text("🛠 Buy Bot Settings:", reply_markup=_settings_keyboard())
-
 
 # ---------------- CALLBACKS (CONFIRM & SETTINGS) ----------------
 async def bt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -655,7 +665,6 @@ async def bt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PENDING_DM.pop(uid, None)
         return
 
-
 # ---------------- LEGACY COMMANDS (OPTIONAL) ----------------
 async def cmd_untrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -665,7 +674,6 @@ async def cmd_untrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     remove_token(chat_id, mint)
     await update.message.reply_text(f"🗑 Stopped tracking {short_mint(mint)}.")
-
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -687,15 +695,15 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-
+# ---------------- REGISTER ----------------
 def register_buytracker(app):
     init_db()
 
-    # GROUP command to kick off DM flow
+    # GROUP command to kick off pairing
     app.add_handler(CommandHandler("track", cmd_track_group, filters.ChatType.GROUPS))
 
-    # DM entry via /start track_<chat_id> — register at HIGH PRIORITY
-    app.add_handler(CommandHandler("start", start_buy_dm, filters.ChatType.PRIVATE), group=-100)
+    # DM entry via "track <code>" (NOT /start). Put before general DM routers if any.
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, dm_entry_by_code), group=-100)
 
     # DM callbacks & text/media during configuration
     app.add_handler(CallbackQueryHandler(bt_callback, pattern=r"^bt:(confirm|again|set:.*)"))
