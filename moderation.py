@@ -177,8 +177,9 @@ async def help_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     DM:
+      - If payload track_<chat_id>: DEFER to buy_tracker.start_buy_dm (stop here).
       - If payload cfg_welcome_* or cfg_rules_*: start that DM flow.
-      - Else: ALWAYS show intro + buttons: [Add me] [Configure groups]
+      - Else: ALWAYS show intro + buttons.
     Group:
       - Hint to /help
     """
@@ -190,6 +191,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Handle deep-link payloads first
         if args:
             payload = args[0]
+
+            # 👇 NEW: if this is the Buy Tracker deep-link, let buy_tracker handle it
+            if payload.startswith("track_"):
+                # Do not send the intro here; buy_tracker.start_buy_dm will process it.
+                raise ApplicationHandlerStop
+
             if payload.startswith("cfg_welcome_"):
                 try:
                     target = int(payload.replace("cfg_welcome_", "", 1))
@@ -203,6 +210,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 except Exception:
                     pass
+
             if payload.startswith("cfg_rules_"):
                 try:
                     target = int(payload.replace("cfg_rules_", "", 1))
@@ -229,7 +237,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Add SentriBot to your group as <b>Admin</b> with <b>write + pin + delete + ban + invite</b> permissions.\n"
             "Make sure all admin permissions are <b>enabled</b> before confirming.\n\n"
             "<i>If no confirmation appears after adding, type</i> /continue <i>in your group.</i>\n\n"
-            "Work with SentriBot? DM @brhm_sol"
+            "Want to Work with SentriBot? DM @brhm_sol"
         )
         kb = InlineKeyboardMarkup(
             [

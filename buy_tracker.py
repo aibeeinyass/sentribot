@@ -19,6 +19,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
+    ApplicationHandlerStop,   # <-- added
 )
 
 # ---------------- SETTINGS ----------------
@@ -405,7 +406,9 @@ async def cmd_track_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- DM ENTRY VIA /start ----------------
 async def start_buy_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """DM-only /start payload: track_<chat_id> → ask for mint."""
+    """DM-only /start payload: track_<chat_id> → ask for mint.
+       If we handle it, STOP propagation so moderation.py's intro doesn't run.
+    """
     chat = update.effective_chat
     if chat.type != "private":
         return  # ignore groups here
@@ -418,7 +421,8 @@ async def start_buy_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         origin_chat_id = int(args[0].split("_", 1)[1])
     except Exception:
         await update.message.reply_text("Invalid link. Please try /track again in your group.")
-        return
+        # we handled this /start; stop others
+        raise ApplicationHandlerStop
 
     uid = update.effective_user.id
     PENDING_DM[uid] = {"stage": "ask_mint", "origin_chat_id": origin_chat_id, "mint": None, "tmp": {}}
@@ -427,6 +431,9 @@ async def start_buy_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🧭 Send the <b>mint address</b> you want to track.",
         parse_mode="HTML"
     )
+
+    # We’ve handled the deep-link. Prevent moderation.py’s /start from sending the intro.
+    raise ApplicationHandlerStop
 
 
 # ---------------- DM TEXT HANDLER ----------------
@@ -689,7 +696,8 @@ def register_buytracker(app):
     app.add_handler(CommandHandler("start", start_buy_dm, filters.ChatType.PRIVATE))
 
     # DM callbacks & text/media during configuration
-    app.add_handler(CallbackQueryHandler(bt_callback, pattern=r"^bt:(confirm|again|set:.*)", block=False))
+    # pattern covers: bt:confirm:<mint> | bt:again | bt:set:<something>
+    app.add_handler(CallbackQueryHandler(bt_callback, pattern=r"^bt:(confirm:|again$|set:)", block=False))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, dm_text_router))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.PHOTO | filters.VIDEO | filters.Document.ALL), dm_media_router))
 
