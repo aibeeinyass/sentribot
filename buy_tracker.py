@@ -286,49 +286,93 @@ async def best_symbol_for_mint(mint: str) -> Optional[str]:
     except Exception:
         return None
 
+# -------- DexScreener helpers: pair + recent trades --------
+DEX_PAIR_TRADES_URL = "https://api.dexscreener.com/latest/dex/trades/{}"
+
+async def fetch_primary_pair_for_mint(mint: str) -> Optional[dict]:
+    """
+    Return the primary DexScreener pair object for a mint, or None.
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(DEXSCREENER_URL.format(mint)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                pairs = data.get("pairs") or []
+                return pairs[0] if pairs else None
+    except Exception:
+        return None
+
+async def fetch_recent_trades(pair_address: str, limit: int = 25) -> list:
+    """
+    Return recent trades for a DexScreener pair. Each item has:
+      - 'txId', 'timestamp' (ms), 'side' ('buy'/'sell'), 'priceUsd', 'amountUsd',
+        'amountToken' (sometimes), and maybe maker/taker.
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(DEX_PAIR_TRADES_URL.format(pair_address), params={"limit": str(limit)}) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+                return data.get("trades") or []
+    except Exception:
+        return []
+
 # ---------------- POLLING ----------------
-last_seen: Dict[str, str] = {}  # mint -> last signature
+# NOTE: now we key by pairAddress and save last seen trade txId
+last_seen: Dict[str, str] = {}  # pairAddress -> last trade txId
 
 async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Poll DexScreener trades per token's primary pair and alert on buys.
+    """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT chat_id, mint, media_file_id, symbol, emoji, min_buy_usd, socials_json, active FROM tracked_tokens WHERE active=1")
+    c.execute("""
+        SELECT chat_id, mint, media_file_id, symbol, emoji, min_buy_usd, socials_json, active
+        FROM tracked_tokens WHERE active=1
+    """)
     rows = c.fetchall()
     conn.close()
 
     for chat_id, mint, media_file_id, symbol, emoji, min_buy_usd, socials_json, active in rows:
-        if is_native_sol(mint):
-            continue
         try:
-            txs = await fetch_transactions(mint, limit=5)
-            if not txs:
-                continue
-            sig = txs[0].get("signature")
-            if not sig or last_seen.get(mint) == sig:
-                continue
-            last_seen[mint] = sig  # prevent dupes
-
-            # Ensure token info
-            token_info = await fetch_token_info(mint)
-            if not symbol:
-                symbol = token_info.get("symbol") or "TOKEN"
-
-            details = await parse_buy(sig, mint)
-            if not details:
+            pair = await fetch_primary_pair_for_mint(mint)
+            if not pair:
                 continue
 
-            amount = float(details.get("amount", 0) or 0)
-            buyer = details.get("buyer") or "?"
-            price = float(token_info.get("price", 0) or 0)
-            mcap = float(token_info.get("mc", 0) or 0)
-            usd_value = amount * price if price else 0.0
+            pair_addr = pair.get("pairAddress")
+            price_usd = float(pair.get("priceUsd", 0) or 0)
+            fdv = float(pair.get("fdv", 0) or 0)
+            base = pair.get("baseToken") or {}
+            psymbol = (base.get("symbol") or "").strip() or symbol or "TOKEN"
+            pname = (base.get("name") or psymbol or "TOKEN")
 
-            # Min buy filter
+            trades = await fetch_recent_trades(pair_addr, limit=25)
+            if not trades:
+                continue
+
+            last_txid = last_seen.get(pair_addr)
+            new_trades = []
+            for t in trades:  # DexScreener returns newest-first
+                txid = t.get("txId")
+                if not txid:
+                    continue
+                if txid == last_txid:
+                    break
+                new_trades.append(t)
+            new_trades.reverse()  # alert in chronological order
+
+            if trades:
+                last_seen[pair_addr] = trades[0].get("txId") or last_txid
+
             threshold = float(min_buy_usd or DEFAULT_MIN_BUY_USD)
-            if usd_value < threshold:
-                continue
+            chosen_emoji = (emoji or DEFAULT_EMOJI)
+            dexs = f"https://dexscreener.com/solana/{pair_addr}"
+            jup = f"https://jup.ag/swap/SOL-{mint}"
 
-            # Socials
             socials_txt = ""
             try:
                 soc = json.loads(socials_json) if socials_json else {}
@@ -341,50 +385,65 @@ async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            # Compose alert
-            chosen_emoji = (emoji or DEFAULT_EMOJI)
-            tx_url = f"https://solscan.io/tx/{sig}"
-            buyer_url = f"https://solscan.io/account/{buyer}" if buyer else tx_url
-            jup = f"https://jup.ag/swap/SOL-{mint}"
-            dexs = f"https://dexscreener.com/solana/{mint}"
+            for t in new_trades:
+                if (t.get("side") or "").lower() != "buy":
+                    continue
+                usd = float(t.get("amountUsd", 0) or 0)
+                if usd < threshold:
+                    continue
 
-            title = f"{chosen_emoji} | {symbol} BUY!"
-            body = (
-                f"🔷 SOL {fmt_amount(usd_value/price) if price else '—'} ({fmt_usd(usd_value)})\n"
-                f"🪙 {symbol} {fmt_amount(amount)}\n"
-                f"🔎 Position: New Holder [{short_wallet(buyer)}]({buyer_url})\n"
-                f"📈 MCap: {fmt_usd(mcap)}{socials_txt}\n"
-                f"[Tx]({tx_url})"
-            )
-            text = f"{title}\n{body}"
+                token_amount = t.get("amountToken")
+                txid = t.get("txId")
+                tx_url = f"https://solscan.io/tx/{txid}"
 
-            buttons = [
-                [InlineKeyboardButton("📊 Dex", url=dexs), InlineKeyboardButton("💲 Buy", url=jup)],
-                [InlineKeyboardButton("Wallet", url=buyer_url), InlineKeyboardButton("Txn", url=tx_url)],
-            ]
-            markup = InlineKeyboardMarkup(buttons)
+                # buyer often not available via DexScreener on Solana
+                buyer_label = "Unknown"
+                buyer_url = tx_url
 
-            if media_file_id:
-                try:
-                    await context.bot.send_photo(
-                        chat_id,
-                        photo=media_file_id,
-                        caption=text,
-                        reply_markup=markup,
-                        parse_mode="Markdown",
-                        disable_web_page_preview=True,
-                    )
-                except Exception:
+                px = float(t.get("priceUsd", 0) or price_usd or 0)
+                mcap = fdv
+
+                title = f"{chosen_emoji} | {psymbol} BUY!"
+                if not token_amount and px:
+                    token_amount = usd / px
+                token_str = fmt_amount(token_amount) if token_amount is not None else "—"
+
+                body = (
+                    f"🔷 ~SOL {fmt_amount(usd/px) if px else '—'} ({fmt_usd(usd)})\n"
+                    f"🪙 {psymbol} {token_str}\n"
+                    f"🔎 Position: New Holder [{buyer_label}]({buyer_url})\n"
+                    f"📈 MCap: {fmt_usd(mcap)}{socials_txt}\n"
+                    f"[Tx]({tx_url})"
+                )
+                text = f"{title}\n{body}"
+
+                buttons = [
+                    [InlineKeyboardButton("📊 Dex", url=dexs), InlineKeyboardButton("💲 Buy", url=jup)],
+                    [InlineKeyboardButton("Txn", url=tx_url)],
+                ]
+                markup = InlineKeyboardMarkup(buttons)
+
+                if media_file_id:
+                    try:
+                        await context.bot.send_photo(
+                            chat_id,
+                            photo=media_file_id,
+                            caption=text,
+                            reply_markup=markup,
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception:
+                        await context.bot.send_message(
+                            chat_id, text, reply_markup=markup, parse_mode="Markdown", disable_web_page_preview=True
+                        )
+                else:
                     await context.bot.send_message(
                         chat_id, text, reply_markup=markup, parse_mode="Markdown", disable_web_page_preview=True
                     )
-            else:
-                await context.bot.send_message(
-                    chat_id, text, reply_markup=markup, parse_mode="Markdown", disable_web_page_preview=True
-                )
 
         except Exception as e:
-            logging.error(f"Error polling {mint}: {e}")
+            logging.error(f"Buy poll error for {mint}: {e}")
 
 # ---------------- DM FLOW STATE ----------------
 # user_id -> dict(stage, origin_chat_id, mint, tmp_fields)
@@ -481,7 +540,7 @@ async def buy_dm_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await dm_text_router(update, context)
     raise ApplicationHandlerStop
 
-# ---------------- DM ENTRY via "track <code>" (works even without pending) ----------------
+# ---------------- DM ENTRY via "track <code)" (works even without pending) ----------------
 async def dm_entry_by_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """DM-only: user sends 'track 123456' to begin the wizard (even if no pending state)."""
     chat = update.effective_chat
@@ -756,7 +815,7 @@ def register_buytracker(app):
     # DM entry via "track <code>" — VERY high priority
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, dm_entry_by_code), group=-300)
 
-    # 🔴 NEW: High-priority DM gate for buy tracker (runs after the code-catcher above)
+    # 🔴 High-priority DM gate for buy tracker (runs after the code-catcher above)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.TEXT | filters.Caption()), buy_dm_gate), group=-250)
 
     # DM callbacks & text/media during configuration
