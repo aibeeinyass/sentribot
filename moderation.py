@@ -173,13 +173,12 @@ async def help_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # At least tell the user
             await q.answer("Could not update the menu. Try /help", show_alert=True)
 
-# -------- START / CONTINUE / CONFIG MENU --------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     DM:
-      - If payload track_<chat_id> (or sell_<chat_id>): DEFER to buy/sell tracker /start handlers (do nothing here).
+      - If payload track_<chat_id> (or sell_<chat_id>): let buy/sell tracker handle (do nothing here).
       - If payload cfg_welcome_* or cfg_rules_*: start that DM flow.
-      - Else: ALWAYS show intro + buttons.
+      - Else: show intro + buttons.
     Group:
       - Hint to /help
     """
@@ -188,12 +187,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
 
     if chat and chat.type == "private":
-        # If this is a buy/sell tracker deep-link, let those handlers process it.
-        # (buy_tracker.py / sell_tracker.py each register their own CommandHandler("start", ...))
+        # ⬇️ If this is a buy/sell tracker deep-link, defer to those modules.
         if args and (args[0].startswith("track_") or args[0].startswith("sell_")):
-            return  # allow the other /start handler to run
+            return
 
-        # Handle our own deep-link payloads for welcome/rules config
+        # --- your existing payload handling for cfg_welcome_/cfg_rules_ stays here ---
         if args:
             payload = args[0]
 
@@ -224,7 +222,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
-        # No (handled) payload → ALWAYS show intro (no auto config list)
+        # No tracker/cfg payload -> show intro (unchanged)
         text = (
             "🎩 <b>Welcome to SentriBot!</b>\n"
             "Your private, project-only community monitoring & alerts bot.\n\n"
@@ -237,7 +235,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Add SentriBot to your group as <b>Admin</b> with <b>write + pin + delete + ban + invite</b> permissions.\n"
             "Make sure all admin permissions are <b>enabled</b> before confirming.\n\n"
             "<i>If no confirmation appears after adding, type</i> /continue <i>in your group.</i>\n\n"
-            "Want to Work with SentriBot? DM @brhm_sol"
+            "Work with SentriBot? DM @brhm_sol"
         )
         kb = InlineKeyboardMarkup(
             [
@@ -703,7 +701,7 @@ def register_moderation(app: Application):
     app.post_init = _post_init
 
     # Commands
-    app.add_handler(CommandHandler("start", start), block=False)
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("continue", continue_cmd))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("rules", rules))
