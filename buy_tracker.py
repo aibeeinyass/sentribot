@@ -405,7 +405,7 @@ def _settings_keyboard() -> InlineKeyboardMarkup:
 
 # ---------------- COMMANDS (GROUP → PAIRING CODE) ----------------
 async def cmd_track_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Group: /track → show pairing code + plain DM link."""
+    """Group: /track → show pairing code + plain DM link and set pending DM state."""
     chat = update.effective_chat
     user = update.effective_user
     if chat.type not in ("group", "supergroup"):
@@ -416,12 +416,21 @@ async def cmd_track_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = _gen_pair_code()
     _put_code(code, origin_chat_id=chat.id, user_id=user.id)
 
+    # 🔴 NEW: mark this user as "awaiting code" so DM accepts plain text immediately
+    PENDING_DM[user.id] = {
+        "stage": "await_code",
+        "origin_chat_id": chat.id,
+        "mint": None,
+        "tmp": {},
+        "code": code,
+    }
+
     dm_url = f"https://t.me/{me.username}"
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Open DM with SentriBot", url=dm_url)]])
     await update.message.reply_text(
         "I’ll guide you in DM to set this up for this group.\n\n"
         f"🔐 Pairing code: <code>{code}</code>\n"
-        "➡️ In DM, send exactly: <b>track " + code + "</b>\n"
+        "➡️ In DM, send: <b>track {code}</b> or just <b>{code}</b>\n"
         "<i>(Code expires in 10 minutes and only works for you.)</i>",
         reply_markup=kb,
         parse_mode="HTML",
@@ -430,9 +439,10 @@ async def cmd_track_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- DM ENTRY via "track <code>" (NO /start) ----------------
 PAIR_RX = re.compile(r"^\s*track\s+(\d{6})\s*$", re.IGNORECASE)
+ANY_CODE_RX = re.compile(r"\b(\d{6})\b")
 
 async def dm_entry_by_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """DM-only: user sends 'track 123456' to begin the wizard."""
+    """DM-only: user sends 'track 123456' to begin the wizard (works even without pending state)."""
     chat = update.effective_chat
     msg = update.message
     if chat.type != "private" or not msg or not msg.text:
@@ -468,7 +478,30 @@ async def dm_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stage = state.get("stage")
     origin = state.get("origin_chat_id")
 
-    # Disallow commands inside the flow
+    # 🔴 NEW: waiting for the pairing code (plain text accepted)
+    if stage == "await_code":
+        text = msg.text.strip()
+        # accept either "track 123456" or any 6 digits in the message
+        m = PAIR_RX.match(text) or ANY_CODE_RX.search(text)
+        if not m:
+            await msg.reply_text(
+                "Please send the pairing code I gave you in the group (e.g., <code>track 123456</code> or just <code>123456</code>).",
+                parse_mode="HTML",
+            )
+            return
+
+        code = m.group(1)
+        origin_from_code = _pop_valid_code(code, uid)
+        if not origin_from_code or origin_from_code != origin:
+            await msg.reply_text("❌ Invalid or expired code. Go back to your group and run /track again.")
+            return
+
+        # advance to mint step
+        state["stage"] = "ask_mint"
+        await msg.reply_text("🧭 Send the <b>mint address</b> you want to track.", parse_mode="HTML")
+        return
+
+    # Disallow commands inside the rest of the flow
     if msg.text.strip().startswith("/"):
         await msg.reply_text("Please send text (no /commands) while configuring.")
         return
@@ -703,7 +736,8 @@ def register_buytracker(app):
     app.add_handler(CommandHandler("track", cmd_track_group, filters.ChatType.GROUPS))
 
     # DM entry via "track <code>" (NOT /start). Put before general DM routers if any.
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, dm_entry_by_code), group=-100)
+    # make this HIGHER priority than other DM gates
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, dm_entry_by_code), group=-200)
 
     # DM callbacks & text/media during configuration
     app.add_handler(CallbackQueryHandler(bt_callback, pattern=r"^bt:(confirm|again|set:.*)"))
