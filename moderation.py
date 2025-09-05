@@ -189,8 +189,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if chat and chat.type == "private":
         # Handle deep-link payloads first
-        if args:
-            payload = args[0]
+         if args and (args[0].startswith("track_") or args[0].startswith("sell_")):
+            return
 
             # 👇 NEW: if this is the Buy Tracker deep-link, let buy_tracker handle it
             if payload.startswith("track_"):
