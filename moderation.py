@@ -124,37 +124,37 @@ def _render_help_section(section: str) -> Tuple[str, InlineKeyboardMarkup]:
             "/about — About the bot\n"
             "/setwelcome — Set welcome message (DM flow)\n"
             "/setrules — Set /rules text (DM flow)\n"
-            "/filter <trigger> — Add a filter (interactive)\n"
+            "/filter &lt;trigger&gt; — Add a filter (interactive)\n"
             "/filters — List filters\n"
-            "/delfilter <trigger> — Delete a filter\n"
+            "/delfilter &lt;trigger&gt; — Delete a filter\n"
             "/warn — Warn a user (reply)\n"
             "/pin — Pin the latest message\n"
         )
     elif section == "buy":
         text = (
             "<b>🟢 Buy Tracker</b>\n\n"
-            "/track <mint> — Start buy tracking\n"
-            "/untrack <mint> — Stop buy tracking\n"
+            "/track &lt;mint&gt; — Start buy tracking\n"
+            "/untrack &lt;mint&gt; — Stop buy tracking\n"
             "/list — List tracked tokens\n"
-            "/skip <txsig> — Ignore a transaction\n"
+            "/skip &lt;txsig&gt; — Ignore a transaction\n"
         )
     elif section == "sell":
         text = (
             "<b>🔴 Sell Tracker</b>\n\n"
-            "/track_sell <mint> — Start sell tracking\n"
+            "/track_sell &lt;mint&gt; — Start sell tracking\n"
             "/sell_skip — Skip media for last /track_sell\n"
-            "/untrack_sell <mint> — Stop sell tracking\n"
+            "/untrack_sell &lt;mint&gt; — Stop sell tracking\n"
             "/list_sells — List tracked tokens (with whale threshold)\n"
-            "/sellthreshold <mint> <usd> — Set whale alert threshold\n"
+            "/sellthreshold &lt;mint&gt; &lt;usd&gt; — Set whale alert threshold\n"
         )
     elif section == "x":
         text = (
             "<b>🐦 X Alerts</b>\n\n"
-            "/x_track <handle> — Track new followers for an account\n"
-            "/x_untrack <handle> — Stop tracking\n"
+            "/x_track &lt;handle&gt; — Track new followers for an account\n"
+            "/x_untrack &lt;handle&gt; — Stop tracking\n"
             "/x_list — List tracked X accounts\n"
             "/x_debug — Check X API token status\n"
-            "/x_testuser <handle> — Test lookup (debug)\n\n"
+            "/x_testuser &lt;handle&gt; — Test lookup (debug)\n\n"
             "<i>Followers are checked every 2 minutes.</i>\n"
         )
     else:
@@ -735,7 +735,9 @@ def register_moderation(app: Application):
     # Group text handler first (filters & interactive replies), then spam
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_group_text))
     app.add_handler(MessageHandler((filters.TEXT | filters.Caption()) & ~filters.COMMAND, detect_spam))
-
+    group=-10
+   
+   )
     # Membership updates
     app.add_handler(ChatMemberHandler(user_member_update, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(my_bot_member_update, ChatMemberHandler.MY_CHAT_MEMBER))
