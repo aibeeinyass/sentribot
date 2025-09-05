@@ -177,7 +177,7 @@ async def help_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     DM:
-      - If payload track_<chat_id>: DEFER to buy_tracker.start_buy_dm (stop here).
+      - If payload track_<chat_id> (or sell_<chat_id>): DEFER to buy/sell tracker /start handlers (do nothing here).
       - If payload cfg_welcome_* or cfg_rules_*: start that DM flow.
       - Else: ALWAYS show intro + buttons.
     Group:
@@ -188,14 +188,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
 
     if chat and chat.type == "private":
-        # Handle deep-link payloads first
-         if args and (args[0].startswith("track_") or args[0].startswith("sell_")):
-            return
+        # If this is a buy/sell tracker deep-link, let those handlers process it.
+        # (buy_tracker.py / sell_tracker.py each register their own CommandHandler("start", ...))
+        if args and (args[0].startswith("track_") or args[0].startswith("sell_")):
+            return  # allow the other /start handler to run
 
-            # 👇 NEW: if this is the Buy Tracker deep-link, let buy_tracker handle it
-            if payload.startswith("track_"):
-                # Do not send the intro here; buy_tracker.start_buy_dm will process it.
-                raise ApplicationHandlerStop
+        # Handle our own deep-link payloads for welcome/rules config
+        if args:
+            payload = args[0]
 
             if payload.startswith("cfg_welcome_"):
                 try:
@@ -224,7 +224,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
-        # No payload → ALWAYS show intro (no auto config list)
+        # No (handled) payload → ALWAYS show intro (no auto config list)
         text = (
             "🎩 <b>Welcome to SentriBot!</b>\n"
             "Your private, project-only community monitoring & alerts bot.\n\n"
