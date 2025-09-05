@@ -396,6 +396,8 @@ async def cmd_track_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type not in ("group", "supergroup"):
         await update.message.reply_text("Use /track inside a group to configure via DM.")
         return
+
+    me = await context.bot.get_me()
     deep = f"https://t.me/sentrip_bot?start=track_{chat.id}"
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Open DM to set up Buy Tracker", url=deep)]])
     await update.message.reply_text(
@@ -686,18 +688,17 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------------- REGISTER ----------------
 def register_buytracker(app):
     init_db()
+
     # GROUP command to kick off DM flow
     app.add_handler(CommandHandler("track", cmd_track_group, filters.ChatType.GROUPS))
 
-    # DM entry via /start track_<chat_id>
-    app.add_handler(CommandHandler("start", start_buy_dm, filters.ChatType.PRIVATE))
+    # DM entry via /start track_<chat_id> — register at HIGH PRIORITY
+    app.add_handler(CommandHandler("start", start_buy_dm, filters.ChatType.PRIVATE), group=-100)
 
     # DM callbacks & text/media during configuration
-    # pattern covers: bt:confirm:<mint> | bt:again | bt:set:<something>
-    app.add_handler(CallbackQueryHandler(bt_callback, pattern=r"^bt:(confirm:|again$|set:)", block=False))
+    app.add_handler(CallbackQueryHandler(bt_callback, pattern=r"^bt:(confirm|again|set:.*)"))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, dm_text_router))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.PHOTO | filters.VIDEO | filters.Document.ALL), dm_media_router))
 
