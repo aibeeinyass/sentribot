@@ -4,17 +4,16 @@ import sqlite3
 import logging
 import json
 import aiohttp
+import asyncio
 import time
 import secrets
 import re
-from typing import Dict, Optional
+from typing import Dict, Optional, Any, List
 
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputMediaPhoto,
-    InputMediaVideo,
 )
 from telegram.ext import (
     CommandHandler,
@@ -22,19 +21,17 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
-    ApplicationHandlerStop,   # we'll use this in the DM gate
+    ApplicationHandlerStop,   # used in the DM gate
 )
 
 # ---------------- SETTINGS ----------------
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
-HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
+HELIUS_HTTP_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else None
+HELIUS_WS_URL   = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else None
+
+DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
+DEXSCREENER_TRADES_URL = "https://api.dexscreener.com/latest/dex/trades/{}"
 PUMPFUN_URL = "https://api.pump.fun/v1/token/{}"   # best-effort (may fail)
-ADD_TO_GROUP_URL = (
-    "https://telegram.me/sentrip_bot"
-    "?startgroup=true"
-    "&admin=change_info+delete_messages+ban_users+invite_users+pin_messages"
-)
 
 DB_PATH = "tracked_tokens.db"
 logging.basicConfig(level=logging.INFO)
@@ -46,17 +43,44 @@ PAIR_CODE_TTL_SEC = 10 * 60  # 10 minutes
 
 NATIVE_SOL_MINTS = {"So11111111111111111111111111111111111111112"}
 
+# ---------------- PROGRAM IDS + TOGGLES ----------------
+# Hard-coded mainnet defaults (can be overridden by env)
+RAYDIUM_AMM_V4_PROGRAM_ID = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+RAYDIUM_CPMM_PROGRAM_ID   = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
+
+# Replace this only after you VERIFY the Pump.fun Program Id on Solscan (Program Id on a buy tx).
+PUMPFUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"  # <— verify & update if needed
+
+# Feature toggles: include program filters in WS subscribe
+USE_RAYDIUM_FILTER = True
+USE_PUMPFUN_FILTER = True  # set True to monitor bonding-curve (pre-Raydium) buys
+
+# Optional: allow env overrides (comma-separated)
+def _split_env(name: str) -> List[str]:
+    val = os.getenv(name, "").strip()
+    if not val:
+        return []
+    return [x.strip() for x in val.split(",") if x.strip()]
+
+# Build program id lists (env override OR defaults)
+RAYDIUM_PROGRAM_IDS: List[str] = _split_env("RAYDIUM_PROGRAM_IDS") or [
+    RAYDIUM_AMM_V4_PROGRAM_ID, RAYDIUM_CPMM_PROGRAM_ID
+]
+PUMPFUN_PROGRAM_IDS: List[str] = _split_env("PUMPFUN_PROGRAM_IDS") or (
+    [PUMPFUN_PROGRAM_ID] if PUMPFUN_PROGRAM_ID else []
+)
+# If you want to include routers/aggregators (like Jupiter), add to env: AGGREGATOR_PROGRAM_IDS="JUPw...,..."
+AGGREGATOR_PROGRAM_IDS: List[str] = _split_env("AGGREGATOR_PROGRAM_IDS")
+
 # ---------------- PAIRING CODES (Group → DM) ----------------
 # code -> {"origin_chat_id": int, "user_id": int, "ts": float}
 PAIR_CODES: Dict[str, Dict] = {}
 
 def _gen_pair_code() -> str:
-    # 6-digit numeric, avoid collisions
     for _ in range(20):
         code = f"{secrets.randbelow(900000) + 100000}"
         if code not in PAIR_CODES:
             return code
-    # very unlikely fallback
     return f"{secrets.randbelow(900000) + 100000}"
 
 def _put_code(code: str, origin_chat_id: int, user_id: int):
@@ -66,11 +90,9 @@ def _pop_valid_code(code: str, user_id: int) -> Optional[int]:
     data = PAIR_CODES.get(code)
     if not data:
         return None
-    # expire old
     if time.time() - data["ts"] > PAIR_CODE_TTL_SEC:
         PAIR_CODES.pop(code, None)
         return None
-    # bind to same user
     if data["user_id"] != user_id:
         return None
     PAIR_CODES.pop(code, None)
@@ -99,14 +121,9 @@ def init_db():
     conn.commit()
     conn.close()
 
-def upsert_token(
-    chat_id: int,
-    mint: str,
-    **fields,
-):
+def upsert_token(chat_id: int, mint: str, **fields):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Ensure row exists
     c.execute(
         "INSERT OR IGNORE INTO tracked_tokens(chat_id, mint, min_buy_usd) VALUES(?, ?, ?)",
         (chat_id, mint, DEFAULT_MIN_BUY_USD),
@@ -185,61 +202,7 @@ def short_mint(mint: str) -> str:
         return mint or "?"
     return mint[:4] + "…" + mint[-4:]
 
-# ---------------- EXTERNAL LOOKUPS ----------------
-async def fetch_transactions(mint: str, limit: int = 5):
-    payload = {
-        "jsonrpc": "2.0",
-        "id": "tx_fetch",
-        "method": "getSignaturesForAddress",
-        "params": [mint, {"limit": limit}],
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(HELIUS_URL, json=payload) as resp:
-            data = await resp.json()
-            return data.get("result", [])
-
-async def get_transaction(signature: str):
-    payload = {
-        "jsonrpc": "2.0",
-        "id": "tx_parse",
-        "method": "getTransaction",
-        "params": [signature, {"encoding": "jsonParsed"}],
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(HELIUS_URL, json=payload) as resp:
-            data = await resp.json()
-            return data.get("result")
-
-async def parse_buy(signature: str, mint: str):
-    tx = await get_transaction(signature)
-    if not tx:
-        return None
-
-    meta = tx.get("meta", {}) or {}
-    pre = meta.get("preTokenBalances", []) or []
-    post = meta.get("postTokenBalances", []) or []
-
-    def amt(tb):
-        u = tb.get("uiTokenAmount", {}) or {}
-        return int(u.get("amount", 0) or 0), int(u.get("decimals", 0) or 0)
-
-    pre_map = {}
-    for b in pre:
-        if b.get("mint") == mint:
-            a, d = amt(b)
-            pre_map[(b.get("owner"), mint)] = (a, d)
-
-    for b in post:
-        if b.get("mint") != mint:
-            continue
-        a_post, dec = amt(b)
-        a_pre, _ = pre_map.get((b.get("owner"), mint), (0, dec))
-        delta = a_post - a_pre
-        if delta > 0:
-            tokens = delta / (10 ** max(dec, 0))
-            return {"buyer": b.get("owner"), "amount": tokens, "decimals": dec}
-    return None
-
+# ---------------- EXTERNAL LOOKUPS (HTTP) ----------------
 async def fetch_token_info(mint: str):
     # 1) Pump.fun
     try:
@@ -261,7 +224,7 @@ async def fetch_token_info(mint: str):
     # 2) DexScreener
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(DEXSCREENER_URL.format(mint)) as resp:
+            async with session.get(DEXSCREENER_TOKENS_URL.format(mint)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     pairs = data.get("pairs", []) or []
@@ -275,27 +238,12 @@ async def fetch_token_info(mint: str):
                         return {"symbol": symbol, "price": price_usd, "mc": fdv, "name": name}
     except Exception:
         pass
-
     return {"symbol": "TOKEN", "price": 0, "mc": 0, "name": "TOKEN"}
 
-async def best_symbol_for_mint(mint: str) -> Optional[str]:
-    try:
-        info = await fetch_token_info(mint)
-        sym = (info.get("symbol") or "").strip()
-        return sym or None
-    except Exception:
-        return None
-
-# -------- DexScreener helpers: pair + recent trades --------
-DEX_PAIR_TRADES_URL = "https://api.dexscreener.com/latest/dex/trades/{}"
-
 async def fetch_primary_pair_for_mint(mint: str) -> Optional[dict]:
-    """
-    Return the primary DexScreener pair object for a mint, or None.
-    """
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(DEXSCREENER_URL.format(mint)) as resp:
+            async with session.get(DEXSCREENER_TOKENS_URL.format(mint)) as resp:
                 if resp.status != 200:
                     return None
                 data = await resp.json()
@@ -305,14 +253,9 @@ async def fetch_primary_pair_for_mint(mint: str) -> Optional[dict]:
         return None
 
 async def fetch_recent_trades(pair_address: str, limit: int = 25) -> list:
-    """
-    Return recent trades for a DexScreener pair. Each item has:
-      - 'txId', 'timestamp' (ms), 'side' ('buy'/'sell'), 'priceUsd', 'amountUsd',
-        'amountToken' (sometimes), and maybe maker/taker.
-    """
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(DEX_PAIR_TRADES_URL.format(pair_address), params={"limit": str(limit)}) as resp:
+            async with session.get(DEXSCREENER_TRADES_URL.format(pair_address), params={"limit": str(limit)}) as resp:
                 if resp.status != 200:
                     return []
                 data = await resp.json()
@@ -320,14 +263,440 @@ async def fetch_recent_trades(pair_address: str, limit: int = 25) -> list:
     except Exception:
         return []
 
-# ---------------- POLLING ----------------
-# NOTE: now we key by pairAddress and save last seen trade txId
-last_seen: Dict[str, str] = {}  # pairAddress -> last trade txId
+# ---------------- REALTIME: HELIUS WS MANAGER ----------------
+def _accounts_in_notif(notif: dict) -> List[str]:
+    accs = set(notif.get("accounts") or [])
+    try:
+        keys = ((notif.get("transaction") or {}).get("message") or {}).get("accountKeys") or []
+        accs.update(keys)
+    except Exception:
+        pass
+    return list(accs)
 
-async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
+def _delta_for_mint(notif: dict, base_mint: str) -> float:
     """
-    Poll DexScreener trades per token's primary pair and alert on buys.
+    Sum (post - pre) of base_mint across token balances.
+    Positive delta => net base_mint credited => BUY for the token.
     """
+    meta = notif.get("meta") or {}
+    pre = meta.get("preTokenBalances") or []
+    post = meta.get("postTokenBalances") or []
+
+    def amt(tb):
+        u = tb.get("uiTokenAmount") or {}
+        return int(u.get("amount", 0) or 0), int(u.get("decimals", 0) or 0)
+
+    pre_map = {}
+    for b in pre:
+        if b.get("mint") == base_mint:
+            a, d = amt(b)
+            pre_map[(b.get("owner"), base_mint)] = (a, d)
+
+    total = 0.0
+    dec = 0
+    for b in post:
+        if b.get("mint") != base_mint:
+            continue
+        a_post, dec = amt(b)
+        a_pre, _ = pre_map.get((b.get("owner"), base_mint), (0, dec))
+        total += (a_post - a_pre) / (10 ** max(dec, 0))
+    return total  # positive => buy, negative => sell
+
+class HeliusWS:
+    """
+    Single connection to Helius Enhanced Websocket.
+    - Raydium path: subscribe per pair (account include) + optional program filter
+    - Pump.fun path: subscribe per mint (account include) + Pump.fun program filter
+    Automatic handoff: if a token has no Raydium pair yet, subscribe via Pump.fun; once pair appears, switch.
+    """
+    def __init__(self):
+        self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.ready = asyncio.Event()
+        self._id = 1
+
+        # raydium: pair_addr -> payload
+        self.r_subs: Dict[str, Dict[str, Any]] = {}
+        # pumpfun: mint -> payload
+        self.p_subs: Dict[str, Dict[str, Any]] = {}
+
+        # last tx dedupe
+        self.last_txid: Dict[str, str] = {}
+
+        # reconnect backoff
+        self._reconnect_delay = 2
+
+    async def ensure_connected(self):
+        if not HELIUS_WS_URL:
+            logging.warning("HELIUS_API_KEY not set; WS disabled.")
+            return
+        if self.ws and not self.ws.closed:
+            return
+        await self._connect()
+
+    async def _connect(self):
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+        logging.info("Connecting to Helius WS...")
+        self.ws = await self.session.ws_connect(HELIUS_WS_URL, heartbeat=20)
+        self.ready.set()
+        self._reconnect_delay = 2
+        await self._resubscribe_all()
+        asyncio.create_task(self._receiver_loop())
+
+    async def _receiver_loop(self):
+        try:
+            async for msg in self.ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    await self._handle_message(json.loads(msg.data))
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    break
+        except Exception as e:
+            logging.error(f"WS receiver error: {e}")
+        finally:
+            await self._schedule_reconnect()
+
+    async def _schedule_reconnect(self):
+        self.ready.clear()
+        try:
+            if self.ws:
+                await self.ws.close()
+        except Exception:
+            pass
+        logging.warning("WS disconnected; scheduling reconnect...")
+        await asyncio.sleep(self._reconnect_delay)
+        self._reconnect_delay = min(self._reconnect_delay * 2, 30)
+        try:
+            await self._connect()
+        except Exception as e:
+            logging.error(f"Reconnect failed: {e}")
+            asyncio.create_task(self._schedule_reconnect())
+
+    def _next_id(self) -> int:
+        self._id += 1
+        return self._id
+
+    async def _send(self, payload: dict):
+        if not self.ws or self.ws.closed:
+            return
+        await self.ws.send_str(json.dumps(payload))
+
+    async def _resubscribe_all(self):
+        # Raydium pairs
+        for pair_addr in list(self.r_subs.keys()):
+            await self.subscribe_raydium_pair(pair_addr)
+        # Pump.fun mints
+        for mint in list(self.p_subs.keys()):
+            await self.subscribe_pumpfun_mint(mint)
+
+    # ----- Subscribe builders -----
+    async def subscribe_raydium_pair(self, pair_addr: str):
+        if not HELIUS_WS_URL:
+            return
+        params = {
+            "commitment": "confirmed",
+            "encoding": "jsonParsed",
+            "accounts": {"include": [pair_addr]},
+            "accountInclude": [pair_addr],
+        }
+        # Tighten with program filters if enabled
+        program_ids: List[str] = []
+        if USE_RAYDIUM_FILTER:
+            program_ids.extend(RAYDIUM_PROGRAM_IDS)
+        # Optional aggregators (e.g., routers that still touch Raydium accounts)
+        if AGGREGATOR_PROGRAM_IDS:
+            program_ids.extend(AGGREGATOR_PROGRAM_IDS)
+        if program_ids:
+            params["programIds"] = program_ids
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": self._next_id(),
+            "method": "transactionSubscribe",
+            "params": [params],
+        }
+        await self._send(payload)
+
+    async def subscribe_pumpfun_mint(self, mint: str):
+        if not HELIUS_WS_URL:
+            return
+        params = {
+            "commitment": "confirmed",
+            "encoding": "jsonParsed",
+            "accounts": {"include": [mint]},
+            "accountInclude": [mint],
+        }
+        if USE_PUMPFUN_FILTER and PUMPFUN_PROGRAM_IDS:
+            params["programIds"] = PUMPFUN_PROGRAM_IDS
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": self._next_id(),
+            "method": "transactionSubscribe",
+            "params": [params],
+        }
+        await self._send(payload)
+
+    # ----- Incoming notifications -----
+    async def _handle_message(self, data: dict):
+        if "result" in data and "id" in data and "method" not in data:
+            # subscribe ack, ignore
+            return
+
+        if data.get("method") != "transactionNotification":
+            return
+
+        notif = (data.get("params") or {}).get("result") or {}
+        accs = _accounts_in_notif(notif)
+
+        # Raydium (by pair)
+        for pair_addr, sub in list(self.r_subs.items()):
+            if pair_addr in accs:
+                await self._handle_swap_raydium(pair_addr, sub, notif)
+
+        # Pump.fun (by mint)
+        for mint, sub in list(self.p_subs.items()):
+            if mint in accs:
+                await self._handle_buy_pumpfun(mint, sub, notif)
+
+    # ----- Decoders / handlers -----
+    async def _handle_swap_raydium(self, pair_addr: str, sub: Dict[str, Any], notif: dict):
+        txid = (notif.get("transaction") or {}).get("signatures", [None])[0] or notif.get("signature")
+        if not txid:
+            return
+        key = f"r:{pair_addr}"
+        if self.last_txid.get(key) == txid:
+            return
+        self.last_txid[key] = txid
+
+        # Classify by base mint delta
+        base_mint = sub["mint"]
+        delta = _delta_for_mint(notif, base_mint)
+        side = "buy" if delta > 0 else "sell" if delta < 0 else None
+        if side != "buy":
+            return
+
+        usd = None
+        amount_token = abs(delta) if delta else None
+
+        # Try Helius enhanced swap events first
+        events = (notif.get("events") or {})
+        swap_evs = events.get("swap") or []
+        if not isinstance(swap_evs, list):
+            swap_evs = [swap_evs]
+        for ev in swap_evs:
+            info = ev.get("swapInfo") or {}
+            if usd is None:
+                usd = info.get("nativeUsd") or info.get("usdValue")
+
+        # Fallback: DexScreener trade for this tx
+        if usd is None or amount_token is None:
+            trades = await fetch_recent_trades(pair_addr, limit=15)
+            tmatch = next((t for t in trades if (t.get("txId") == txid)), None)
+            if tmatch:
+                try:
+                    usd = float(tmatch.get("amountUsd") or 0) if usd is None else usd
+                except Exception:
+                    pass
+                if amount_token is None:
+                    try:
+                        amount_token = float(tmatch.get("amountToken") or 0)
+                    except Exception:
+                        pass
+
+        # If still no USD, estimate with cached price
+        if usd is None:
+            px = float(sub.get("price_usd") or 0)
+            if px and amount_token is not None:
+                usd = amount_token * px
+
+        if usd is None:
+            return
+        if usd < float(sub.get("min_buy_usd") or DEFAULT_MIN_BUY_USD):
+            return
+
+        await self._send_alert(pair_addr, sub, txid, usd, amount_token)
+
+    async def _handle_buy_pumpfun(self, mint: str, sub: Dict[str, Any], notif: dict):
+        txid = (notif.get("transaction") or {}).get("signatures", [None])[0] or notif.get("signature")
+        if not txid:
+            return
+        key = f"p:{mint}"
+        if self.last_txid.get(key) == txid:
+            return
+        self.last_txid[key] = txid
+
+        # Delta of base mint; Pump.fun “buy” increases base token
+        delta = _delta_for_mint(notif, mint)
+        if delta <= 0:
+            return
+        amount_token = delta
+
+        # Price (pre-listing): try Pump.fun API; cache
+        px = float(sub.get("price_usd") or 0)
+        if not px:
+            info = await fetch_token_info(mint)
+            try:
+                px = float(info.get("price") or 0)
+                if px:
+                    sub["price_usd"] = px
+            except Exception:
+                px = 0.0
+
+        usd = amount_token * px if px else None
+        if usd is None:
+            return
+        if usd < float(sub.get("min_buy_usd") or DEFAULT_MIN_BUY_USD):
+            return
+
+        await self._send_alert("pumpfun", sub, txid, usd, amount_token)
+
+    async def _send_alert(self, key: str, sub: Dict[str, Any], txid: str, usd: float, amount_token: Optional[float]):
+        chat_id = sub["chat_id"]
+        mint = sub["mint"]
+        symbol = sub.get("symbol") or "TOKEN"
+        emoji = sub.get("emoji") or DEFAULT_EMOJI
+        media = sub.get("media_file_id")
+        mcap = float(sub.get("mcap") or 0)
+
+        token_str = fmt_amount(amount_token) if amount_token is not None else "—"
+        tx_url = f"https://solscan.io/tx/{txid}"
+        if key == "pumpfun":
+            dexs = f"https://dexscreener.com/solana/{mint}"  # may be empty pre-listing
+        else:
+            dexs = f"https://dexscreener.com/solana/{key}"
+        jup = f"https://jup.ag/swap/SOL-{mint}"
+
+        socials_txt = ""
+        try:
+            soc = json.loads(sub.get("socials_json") or "{}")
+            parts = []
+            if soc.get("x"): parts.append(f"[X]({soc['x']})")
+            if soc.get("instagram"): parts.append(f"[IG]({soc['instagram']})")
+            if soc.get("website"): parts.append(f"[Web]({soc['website']})")
+            if parts:
+                socials_txt = " " + " • ".join(parts)
+        except Exception:
+            pass
+
+        title = f"{emoji} | {symbol} BUY!"
+        body = (
+            f"🔷 ~USD {fmt_usd(usd)}\n"
+            f"🪙 {symbol} {token_str}\n"
+            f"🔎 Position: New Holder [Unknown]({tx_url})\n"
+            f"📈 MCap: {fmt_usd(mcap)}{socials_txt}\n"
+            f"[Tx]({tx_url})"
+        )
+        text = f"{title}\n{body}"
+
+        buttons = [
+            [InlineKeyboardButton("📊 Dex", url=dexs), InlineKeyboardButton("💲 Buy", url=jup)],
+            [InlineKeyboardButton("Txn", url=tx_url)],
+        ]
+        markup = InlineKeyboardMarkup(buttons)
+
+        try:
+            if media:
+                await ws_context.bot.send_photo(
+                    chat_id,
+                    photo=media,
+                    caption=text,
+                    reply_markup=markup,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
+            else:
+                await ws_context.bot.send_message(
+                    chat_id, text, reply_markup=markup, parse_mode="Markdown", disable_web_page_preview=True
+                )
+        except Exception as e:
+            logging.error(f"Send alert failed: {e}")
+
+    # ----- Public API -----
+    async def add_or_update_token(self, sub_payload: Dict[str, Any]):
+        """
+        sub_payload: {chat_id, mint, symbol, emoji, min_buy_usd, socials_json, media_file_id}
+        - If Raydium pair exists => subscribe on Raydium (pair).
+        - Else => subscribe on Pump.fun (by mint) and start a handoff task that watches for Raydium listing.
+        """
+        mint = sub_payload["mint"]
+
+        # If we were already Pump.fun-subscribing for this mint, keep payload updated
+        if mint in self.p_subs:
+            self.p_subs[mint].update(sub_payload)
+
+        pair = await fetch_primary_pair_for_mint(mint)
+        if pair:
+            pair_addr = pair.get("pairAddress")
+            if pair_addr:
+                # cache pricing/meta
+                try:
+                    base = pair.get("baseToken") or {}
+                    sub_payload["symbol"] = (sub_payload.get("symbol") or base.get("symbol") or "TOKEN")
+                    sub_payload["price_usd"] = float(pair.get("priceUsd", 0) or 0)
+                    sub_payload["mcap"] = float(pair.get("fdv", 0) or 0)
+                except Exception:
+                    pass
+
+                # register Raydium sub
+                self.r_subs[pair_addr] = sub_payload
+                await self.ensure_connected()
+                await self.subscribe_raydium_pair(pair_addr)
+
+                # If we were on Pump.fun for this mint, drop it
+                if mint in self.p_subs:
+                    del self.p_subs[mint]
+                return
+
+        # No Raydium yet — register Pump.fun subscription by mint
+        self.p_subs[mint] = sub_payload
+        await self.ensure_connected()
+        await self.subscribe_pumpfun_mint(mint)
+
+        # Start/refresh a handoff watcher for this mint
+        asyncio.create_task(self._handoff_to_raydium_when_listed(mint))
+
+    async def _handoff_to_raydium_when_listed(self, mint: str):
+        # Periodically check if a Raydium pair appears; then add raydium sub and drop pumpfun sub.
+        for _ in range(60):  # ~10 min if sleep 10s
+            await asyncio.sleep(10)
+            if mint not in self.p_subs:
+                return  # already switched
+            pair = await fetch_primary_pair_for_mint(mint)
+            if not pair:
+                continue
+            pair_addr = pair.get("pairAddress")
+            if not pair_addr:
+                continue
+
+            sub_payload = self.p_subs.get(mint)
+            if not sub_payload:
+                return
+            # cache price/meta
+            try:
+                base = pair.get("baseToken") or {}
+                sub_payload["symbol"] = (sub_payload.get("symbol") or base.get("symbol") or "TOKEN")
+                sub_payload["price_usd"] = float(pair.get("priceUsd", 0) or 0)
+                sub_payload["mcap"] = float(pair.get("fdv", 0) or 0)
+            except Exception:
+                pass
+
+            self.r_subs[pair_addr] = sub_payload
+            await self.subscribe_raydium_pair(pair_addr)
+            # remove pumpfun sub
+            if mint in self.p_subs:
+                del self.p_subs[mint]
+            logging.info(f"Switched {short_mint(mint)} to Raydium pair {pair_addr}")
+            return
+
+# Global WS manager instance and a lightweight context handle for bot send access
+ws_manager = HeliusWS()
+ws_context: ContextTypes.DEFAULT_TYPE  # set at runtime in starter job
+
+# ---------------- POLLING FAILSAFE (DexScreener) ----------------
+fallback_last_seen: Dict[str, str] = {}  # pairAddress -> last trade txId
+
+async def fallback_poll(context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
@@ -342,31 +711,27 @@ async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
             pair = await fetch_primary_pair_for_mint(mint)
             if not pair:
                 continue
-
             pair_addr = pair.get("pairAddress")
-            price_usd = float(pair.get("priceUsd", 0) or 0)
-            fdv = float(pair.get("fdv", 0) or 0)
-            base = pair.get("baseToken") or {}
-            psymbol = (base.get("symbol") or "").strip() or symbol or "TOKEN"
-            pname = (base.get("name") or psymbol or "TOKEN")
+            if not pair_addr:
+                continue
 
             trades = await fetch_recent_trades(pair_addr, limit=25)
             if not trades:
                 continue
 
-            last_txid = last_seen.get(pair_addr)
+            last_txid = fallback_last_seen.get(pair_addr)
             new_trades = []
-            for t in trades:  # DexScreener returns newest-first
+            for t in trades:  # newest-first
                 txid = t.get("txId")
                 if not txid:
                     continue
                 if txid == last_txid:
                     break
                 new_trades.append(t)
-            new_trades.reverse()  # alert in chronological order
+            new_trades.reverse()
 
             if trades:
-                last_seen[pair_addr] = trades[0].get("txId") or last_txid
+                fallback_last_seen[pair_addr] = trades[0].get("txId") or last_txid
 
             threshold = float(min_buy_usd or DEFAULT_MIN_BUY_USD)
             chosen_emoji = (emoji or DEFAULT_EMOJI)
@@ -395,23 +760,19 @@ async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
                 token_amount = t.get("amountToken")
                 txid = t.get("txId")
                 tx_url = f"https://solscan.io/tx/{txid}"
+                px = float(t.get("priceUsd", 0) or pair.get("priceUsd", 0) or 0)
+                mcap = float(pair.get("fdv", 0) or 0)
+                psymbol = (symbol or (pair.get("baseToken") or {}).get("symbol") or "TOKEN")
 
-                # buyer often not available via DexScreener on Solana
-                buyer_label = "Unknown"
-                buyer_url = tx_url
-
-                px = float(t.get("priceUsd", 0) or price_usd or 0)
-                mcap = fdv
-
-                title = f"{chosen_emoji} | {psymbol} BUY!"
                 if not token_amount and px:
                     token_amount = usd / px
                 token_str = fmt_amount(token_amount) if token_amount is not None else "—"
 
+                title = f"{chosen_emoji} | {psymbol} BUY!"
                 body = (
-                    f"🔷 ~SOL {fmt_amount(usd/px) if px else '—'} ({fmt_usd(usd)})\n"
+                    f"🔷 ~USD {fmt_usd(usd)}\n"
                     f"🪙 {psymbol} {token_str}\n"
-                    f"🔎 Position: New Holder [{buyer_label}]({buyer_url})\n"
+                    f"🔎 Position: New Holder [Unknown]({tx_url})\n"
                     f"📈 MCap: {fmt_usd(mcap)}{socials_txt}\n"
                     f"[Tx]({tx_url})"
                 )
@@ -423,30 +784,23 @@ async def poll_tracked(context: ContextTypes.DEFAULT_TYPE):
                 ]
                 markup = InlineKeyboardMarkup(buttons)
 
-                if media_file_id:
-                    try:
+                try:
+                    if media_file_id:
                         await context.bot.send_photo(
-                            chat_id,
-                            photo=media_file_id,
-                            caption=text,
-                            reply_markup=markup,
-                            parse_mode="Markdown",
-                            disable_web_page_preview=True,
+                            chat_id, photo=media_file_id, caption=text, reply_markup=markup,
+                            parse_mode="Markdown", disable_web_page_preview=True
                         )
-                    except Exception:
+                    else:
                         await context.bot.send_message(
                             chat_id, text, reply_markup=markup, parse_mode="Markdown", disable_web_page_preview=True
                         )
-                else:
-                    await context.bot.send_message(
-                        chat_id, text, reply_markup=markup, parse_mode="Markdown", disable_web_page_preview=True
-                    )
+                except Exception as e:
+                    logging.error(f"Fallback send failed: {e}")
 
         except Exception as e:
-            logging.error(f"Buy poll error for {mint}: {e}")
+            logging.error(f"Fallback poll error for {mint}: {e}")
 
 # ---------------- DM FLOW STATE ----------------
-# user_id -> dict(stage, origin_chat_id, mint, tmp_fields)
 PENDING_DM: Dict[int, Dict] = {}
 
 def _settings_keyboard() -> InlineKeyboardMarkup:
@@ -463,7 +817,6 @@ def _settings_keyboard() -> InlineKeyboardMarkup:
 
 # ---------------- COMMANDS (GROUP → PAIRING CODE) ----------------
 async def cmd_track_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Group: /track → show pairing code + plain DM link and set pending DM state."""
     chat = update.effective_chat
     user = update.effective_user
     if chat.type not in ("group", "supergroup"):
@@ -474,7 +827,6 @@ async def cmd_track_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = _gen_pair_code()
     _put_code(code, origin_chat_id=chat.id, user_id=user.id)
 
-    # mark user pending so DM accepts plain text immediately
     PENDING_DM[user.id] = {
         "stage": "await_code",
         "origin_chat_id": chat.id,
@@ -495,12 +847,11 @@ async def cmd_track_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
     )
 
-# ---------------- DM GATE (HIGH PRIORITY, like your welcome/rules gate) ----------------
+# ---------------- DM GATE (HIGH PRIORITY) ----------------
 PAIR_RX = re.compile(r"^\s*track\s+(\d{6})\s*$", re.IGNORECASE)
 ANY_CODE_RX = re.compile(r"\b(\d{6})\b")
 
 async def buy_dm_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Intercept DM while buy-tracker setup is pending; route and stop others."""
     chat = update.effective_chat
     msg = update.message
     if not chat or chat.type != "private" or not msg or not (msg.text or msg.caption):
@@ -509,16 +860,15 @@ async def buy_dm_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     state = PENDING_DM.get(uid)
     if not state:
-        return  # not in our flow; let others handle
+        return
 
-    # Block bot commands while configuring, like your moderation DM gate
-    if any(e.type == "bot_command" for e in (msg.entities or [])) or msg.text.strip().startswith("/"):
+    entities = (msg.entities or []) + (msg.caption_entities or [])
+    if any(getattr(e, "type", "") == "bot_command" for e in entities) or (msg.text and msg.text.strip().startswith("/")):
         await msg.reply_text("Please send the text only (no /commands).")
         raise ApplicationHandlerStop
 
-    # If they’re at await_code, accept “track 123456” or just “123456”
     if state.get("stage") == "await_code":
-        text = msg.text.strip()
+        text = (msg.text or msg.caption or "").strip()
         m = PAIR_RX.match(text) or ANY_CODE_RX.search(text)
         if not m:
             await msg.reply_text(
@@ -531,18 +881,15 @@ async def buy_dm_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not origin_from_code or origin_from_code != state.get("origin_chat_id"):
             await msg.reply_text("❌ Invalid or expired code. Go back to your group and run /track again.")
             raise ApplicationHandlerStop
-        # advance
         state["stage"] = "ask_mint"
         await msg.reply_text("🧭 Send the <b>mint address</b> you want to track.", parse_mode="HTML")
         raise ApplicationHandlerStop
 
-    # Otherwise, route to our normal DM text router and stop
     await dm_text_router(update, context)
     raise ApplicationHandlerStop
 
-# ---------------- DM ENTRY via "track <code)" (works even without pending) ----------------
+# ---------------- DM ENTRY via "track <code)" ----------------
 async def dm_entry_by_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """DM-only: user sends 'track 123456' to begin the wizard (even if no pending state)."""
     chat = update.effective_chat
     msg = update.message
     if chat.type != "private" or not msg or not msg.text:
@@ -550,7 +897,7 @@ async def dm_entry_by_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     m = PAIR_RX.match(msg.text)
     if not m:
-        return  # not our trigger
+        return
 
     uid = update.effective_user.id
     code = m.group(1)
@@ -559,7 +906,6 @@ async def dm_entry_by_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("❌ Invalid or expired code. Go back to your group and run /track again.")
         return
 
-    # Start the wizard
     PENDING_DM[uid] = {"stage": "ask_mint", "origin_chat_id": origin_chat_id, "mint": None, "tmp": {}}
     await msg.reply_text("🧭 Send the <b>mint address</b> you want to track.", parse_mode="HTML")
 
@@ -573,12 +919,11 @@ async def dm_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     state = PENDING_DM.get(uid)
     if not state:
-        return  # not in the flow
+        return
 
     stage = state.get("stage")
     origin = state.get("origin_chat_id")
 
-    # Disallow commands inside the flow
     if msg.text.strip().startswith("/"):
         await msg.reply_text("Please send text (no /commands) while configuring.")
         return
@@ -595,7 +940,6 @@ async def dm_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         symbol = (info.get("symbol") or "TOKEN")
         name = (info.get("name") or symbol)
         state["mint"] = mint
-        # store defaults
         upsert_token(origin, mint, symbol=symbol, min_buy_usd=DEFAULT_MIN_BUY_USD)
         kb = InlineKeyboardMarkup(
             [
@@ -611,7 +955,6 @@ async def dm_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["stage"] = "confirming"
         return
 
-    # Settings sub-states handled by callback + this text router
     if stage == "set_emoji":
         emoji = msg.text.strip()
         upsert_token(origin, state["mint"], emoji=emoji)
@@ -664,7 +1007,7 @@ async def dm_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("🛠 Buy Bot Settings:", reply_markup=_settings_keyboard())
         return
 
-# ---------------- DM MEDIA HANDLER (for media setting) ----------------
+# ---------------- DM MEDIA HANDLER ----------------
 async def dm_media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     msg = update.message
@@ -695,7 +1038,7 @@ async def dm_media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["stage"] = "settings"
     await msg.reply_text("🛠 Buy Bot Settings:", reply_markup=_settings_keyboard())
 
-# ---------------- CALLBACKS (CONFIRM & SETTINGS) ----------------
+# ---------------- CALLBACKS ----------------
 async def bt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -714,7 +1057,6 @@ async def bt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("bt:confirm:"):
-        # Confirmed the mint — show settings
         state["stage"] = "settings"
         await q.message.reply_text("⚙️ Choose from the following options to customize your Buy Bot:", reply_markup=_settings_keyboard())
         return
@@ -751,7 +1093,6 @@ async def bt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if mint:
             remove_token(origin, mint)
         await q.message.reply_text("Token deleted from tracking.")
-        # end the flow
         PENDING_DM.pop(uid, None)
         return
 
@@ -759,23 +1100,26 @@ async def bt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not mint:
             await q.message.reply_text("Missing token context. Please start over with /track in your group.")
             PENDING_DM.pop(uid, None)
-            return
-        set_active(origin, mint, True)
-        row = get_token_row(origin, mint)
-        symbol = (row[1] if row else None) or (await best_symbol_for_mint(mint) or "TOKEN")
-        try:
-            await context.bot.send_message(
-                origin,
-                f"✅ SentriBot Buy Tracker has been successfully activated!\nTracking <b>{symbol}</b> (<code>{short_mint(mint)}</code>).",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-        await q.message.reply_text("All set! Alerts will post in your group when buys meet your settings.")
-        PENDING_DM.pop(uid, None)
+        else:
+            set_active(origin, mint, True)
+            row = get_token_row(origin, mint)
+            # best-effort symbol refresh
+            symbol = (row[1] if row else None) or (await fetch_token_info(mint)).get("symbol") or "TOKEN"
+            try:
+                await context.bot.send_message(
+                    origin,
+                    f"✅ SentriBot Buy Tracker has been successfully activated!\nTracking <b>{symbol}</b> (<code>{short_mint(mint)}</code>).",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+            await q.message.reply_text("All set! Alerts will post in your group when buys meet your settings.")
+            # Kick WS subscribe for this token now
+            await prime_ws_for_chat_token(origin, mint)
+            PENDING_DM.pop(uid, None)
         return
 
-# ---------------- LEGACY COMMANDS (OPTIONAL) ----------------
+# ---------------- LEGACY COMMANDS ----------------
 async def cmd_untrack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("❌ Usage: /untrack <mint>")
@@ -805,18 +1149,58 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+# ---------------- WS STARTUP / PRIMING ----------------
+async def prime_ws_for_chat_token(chat_id: int, mint: str):
+    row = get_token_row(chat_id, mint)
+    if not row:
+        return
+    (rmint, symbol, media, emoji, supply, min_buy, socials_json, active) = row
+    if not active:
+        return
+    payload = {
+        "chat_id": chat_id,
+        "mint": rmint,
+        "symbol": symbol or "TOKEN",
+        "emoji": emoji or DEFAULT_EMOJI,
+        "min_buy_usd": float(min_buy or DEFAULT_MIN_BUY_USD),
+        "socials_json": socials_json or "{}",
+        "media_file_id": media
+    }
+    await ws_manager.add_or_update_token(payload)
+
+async def ws_bootstrap(context: ContextTypes.DEFAULT_TYPE):
+    global ws_context
+    ws_context = context  # allow ws_manager to send via bot
+    await ws_manager.ensure_connected()
+
+    # Subscribe all active tokens
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT chat_id, mint FROM tracked_tokens WHERE active=1""")
+    rows = c.fetchall()
+    conn.close()
+
+    for chat_id, mint in rows:
+        await prime_ws_for_chat_token(chat_id, mint)
+
 # ---------------- REGISTER ----------------
 def register_buytracker(app):
     init_db()
 
-    # GROUP command to kick off pairing
+    # GROUP command
     app.add_handler(CommandHandler("track", cmd_track_group, filters.ChatType.GROUPS))
 
     # DM entry via "track <code>" — VERY high priority
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, dm_entry_by_code), group=-300)
 
-    # 🔴 High-priority DM gate for buy tracker (runs after the code-catcher above)
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.TEXT | filters.Caption()), buy_dm_gate), group=-250)
+    # High-priority DM gate for buy tracker (accept text + media w/ captions)
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL),
+            buy_dm_gate
+        ),
+        group=-250
+    )
 
     # DM callbacks & text/media during configuration
     app.add_handler(CallbackQueryHandler(bt_callback, pattern=r"^bt:(confirm|again|set:.*)"))
@@ -827,5 +1211,8 @@ def register_buytracker(app):
     app.add_handler(CommandHandler("untrack", cmd_untrack))
     app.add_handler(CommandHandler("list", cmd_list))
 
-    # Poller
-    app.job_queue.run_repeating(poll_tracked, interval=30, first=5)
+    # Start WS once app is up
+    app.job_queue.run_once(ws_bootstrap, when=2)
+
+    # Failsafe low-frequency poller (kept, but you can remove if you want pure WS)
+    app.job_queue.run_repeating(fallback_poll, interval=60, first=10)
