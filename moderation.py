@@ -1,0 +1,662 @@
+# moderation.py
+import os, json
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, Any, Optional
+
+from telegram import (
+    Update,
+    ChatPermissions,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    CommandHandler,
+    MessageHandler,
+    ChatMemberHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+
+# -------- SETTINGS --------
+welcome_message = "🎉 Welcome {name} to the group! Please read the rules."
+warn_limit = 3
+warnings: Dict[int, int] = {}  # Store warnings per user
+
+# Per-chat welcome storage + default (in-memory cache; persisted to JSON)
+welcome_messages: Dict[int, str] = {}
+DEFAULT_WELCOME = welcome_message
+
+# Per-chat rules storage (in-memory cache; persisted to JSON)
+rules_texts: Dict[int, str] = {}
+
+# Per-chat filters storage (trigger -> reply)
+filters_map: Dict[int, Dict[str, str]] = {}
+
+# Known chats (chat_id -> title) so DM can list them
+known_chats: Dict[int, str] = {}
+
+# Add-to-group URL with admin scopes
+ADD_TO_GROUP_URL = (
+    "https://telegram.me/sentrip_bot"
+    "?startgroup=true"
+    "&admin=change_info+delete_messages+ban_users+invite_users+pin_messages"
+)
+
+# -------- Data persistence --------
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+PATH_CHATS   = DATA_DIR / "chats.json"
+PATH_WELCOME = DATA_DIR / "welcome.json"
+PATH_RULES   = DATA_DIR / "rules.json"
+PATH_FILTERS = DATA_DIR / "filters.json"
+
+def _load_json(path: Path, default):
+    try:
+        if path.exists():
+            with path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default
+
+def _save_json(path: Path, data):
+    try:
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+# Load caches on import
+known_chats.update({int(k): v for k, v in _load_json(PATH_CHATS, {}).items()})
+welcome_messages.update({int(k): v for k, v in _load_json(PATH_WELCOME, {}).items()})
+rules_texts.update({int(k): v for k, v in _load_json(PATH_RULES, {}).items()})
+filters_map.update({int(k): v for k, v in _load_json(PATH_FILTERS, {}).items()})
+
+def _remember_chat(chat_id: int, title: str):
+    if not title:
+        title = str(chat_id)
+    known_chats[chat_id] = title
+    _save_json(PATH_CHATS, {str(k): v for k, v in known_chats.items()})
+
+# -------- Pending interactive states --------
+# DM pending states: user_id -> target_chat_id
+PENDING_WELCOME_DM: Dict[int, int] = {}
+PENDING_RULES_DM: Dict[int, int] = {}
+
+# Group filters pending reply: chat_id -> {"trigger": str, "user_id": int}
+PENDING_FILTER_REPLY: Dict[int, Dict[str, Any]] = {}
+
+# -------- HELP MENU (HTML-based) --------
+def _render_help_section(section: str) -> tuple[str, InlineKeyboardMarkup]:
+    section = (section or "menu").lower()
+
+    rows = [
+        [
+            InlineKeyboardButton("👋 General", callback_data="help:general"),
+            InlineKeyboardButton("🟢 Buy", callback_data="help:buy"),
+        ],
+        [
+            InlineKeyboardButton("🔴 Sell", callback_data="help:sell"),
+            InlineKeyboardButton("🐦 X Alerts", callback_data="help:x"),
+        ],
+    ]
+    if section != "menu":
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="help:menu")])
+
+    kb = InlineKeyboardMarkup(rows)
+
+    if section == "general":
+        text = (
+            "<b>✨ SentriBot — General</b>\n\n"
+            "• <code>/start</code> — Greet the bot\n"
+            "• <code>/rules</code> — Show rules\n"
+            "• <code>/about</code> — About the bot\n"
+            "• <code>/setwelcome</code> — Set welcome message (DM flow)\n"
+            "• <code>/setrules</code> — Set /rules text (DM flow)\n"
+            "• <code>/filter &lt;trigger&gt;</code> — Add a filter (interactive)\n"
+            "• <code>/filters</code> — List filters\n"
+            "• <code>/delfilter &lt;trigger&gt;</code> — Delete a filter\n"
+            "• <code>/warn</code> — Warn a user (reply)\n"
+            "• <code>/pin</code> — Pin the latest message\n"
+        )
+    elif section == "buy":
+        text = (
+            "<b>🟢 Buy Tracker</b>\n\n"
+            "• <code>/track &lt;mint&gt;</code> — Start buy tracking\n"
+            "• <code>/untrack &lt;mint&gt;</code> — Stop buy tracking\n"
+            "• <code>/list</code> — List tracked tokens\n"
+            "• <code>/skip &lt;txsig&gt;</code> — Ignore a transaction\n"
+        )
+    elif section == "sell":
+        text = (
+            "<b>🔴 Sell Tracker</b>\n\n"
+            "• <code>/track_sell &lt;mint&gt;</code> — Start sell tracking\n"
+            "• <code>/sell_skip</code> — Skip media for last /track_sell\n"
+            "• <code>/untrack_sell &lt;mint&gt;</code> — Stop sell tracking\n"
+            "• <code>/list_sells</code> — List tracked tokens (with whale threshold)\n"
+            "• <code>/sellthreshold &lt;mint&gt; &lt;usd&gt;</code> — Set whale alert threshold\n"
+        )
+    elif section == "x":
+        text = (
+            "<b>🐦 X Alerts</b>\n\n"
+            "• <code>/x_track &lt;handle&gt;</code> — Track new followers for an account\n"
+            "• <code>/x_untrack &lt;handle&gt;</code> — Stop tracking\n"
+            "• <code>/x_list</code> — List tracked X accounts\n"
+            "• <code>/x_debug</code> — Check X API token status\n"
+            "• <code>/x_testuser &lt;handle&gt;</code> — Test lookup (debug)\n\n"
+            "<i>Followers are checked every 2 minutes.</i>\n"
+        )
+    else:
+        text = (
+            "<b>✨ SentriBot Help</b>\n"
+            "Tap a category below to see commands."
+        )
+
+    return text, kb
+
+async def help_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, section = (q.data.split(":", 1) + ["menu"])[:2]
+    text, kb = _render_help_section(section)
+    try:
+        await q.edit_message_text(text=text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await q.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+
+# -------- Admin check --------
+async def _is_admin(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+    try:
+        cm = await context.bot.get_chat_member(chat_id, user_id)
+        return cm.status in ("creator", "administrator")
+    except Exception:
+        return False
+
+# -------- COMMAND HANDLERS --------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    - Private chat:
+        • If /start carries cfg_welcome_<chatid> or cfg_rules_<chatid>: begin DM config flow.
+        • Else: show onboarding + add-to-group button.
+    - Group chat: hint to /help.
+    """
+    chat = update.effective_chat
+    user = update.effective_user
+    args = context.args or []
+
+    # Private chat flows
+    if chat and chat.type == "private":
+        # Deep-link payload handling
+        if args:
+            payload = args[0]
+            if payload.startswith("cfg_welcome_"):
+                try:
+                    target = int(payload.replace("cfg_welcome_", "", 1))
+                    PENDING_WELCOME_DM[user.id] = target
+                    title = known_chats.get(target, str(target))
+                    await update.message.reply_text(
+                        f"✏️ Send the <b>new welcome message</b> for <b>{title}</b> now.\n\n"
+                        "Note: I will always tag the new member first.",
+                        parse_mode="HTML"
+                    )
+                    return
+                except Exception:
+                    pass
+            if payload.startswith("cfg_rules_"):
+                try:
+                    target = int(payload.replace("cfg_rules_", "", 1))
+                    PENDING_RULES_DM[user.id] = target
+                    title = known_chats.get(target, str(target))
+                    await update.message.reply_text(
+                        f"✏️ Send the <b>new /rules text</b> for <b>{title}</b> now.",
+                        parse_mode="HTML"
+                    )
+                    return
+                except Exception:
+                    pass
+
+        # No payload: either show known chats to pick, or onboarding
+        if known_chats:
+            # Offer a simple list of groups to configure (buttons)
+            rows = []
+            # only show first 10 to avoid massive keyboards
+            for cid, title in list(known_chats.items())[:10]:
+                rows.append([InlineKeyboardButton(f"⚙️ Set Welcome: {title}", callback_data=f"cfgpick:welcome:{cid}")])
+            for cid, title in list(known_chats.items())[:10]:
+                rows.append([InlineKeyboardButton(f"⚙️ Set Rules: {title}", callback_data=f"cfgpick:rules:{cid}")])
+            kb = InlineKeyboardMarkup(rows)
+            await update.message.reply_text(
+                "Select a group to configure, or add me to a new one:",
+                reply_markup=kb
+            )
+        else:
+            text = (
+                "🎩 <b>Welcome to SentriBot!</b>\n"
+                "Your private, project-only community monitoring & alerts bot.\n\n"
+                "<b>What you get:</b>\n"
+                "• Real-time Buy & Sell alerts (wallet + TX links)\n"
+                "• X follower alerts (track your project account)\n"
+                "• Member joins/leaves, spam control, keyword tracking\n"
+                "• Fully private — you control every feature\n\n"
+                "<b>How to start:</b>\n"
+                "Add SentriBot to your group as <b>Admin</b> with <b>write + pin + delete + ban + invite</b> permissions.\n\n"
+                "<i>If no confirmation appears after adding, type</i> <code>/continue</code> <i>in your group.</i>\n\n"
+                "Work with SentriBot? DM @brhm_sol"
+            )
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("➕ Add me to your group", url=ADD_TO_GROUP_URL)]]
+            )
+            await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+        return
+
+    # Group hint
+    await update.message.reply_text("Hi! Use /help to see what I can do.")
+
+async def continue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, kb = _render_help_section("menu")
+    await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    section = (context.args[0] if context.args else "menu")
+    text, kb = _render_help_section(section)
+    await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+
+async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    txt = rules_texts.get(chat_id) or (
+        "📜 Group Rules:\n"
+        "1. Be respectful\n"
+        "2. No spam or ads\n"
+        "3. Keep chats friendly"
+    )
+    await update.message.reply_text(txt)
+
+async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 <b>Welcome to SentriBot</b> — Your private community monitoring and insights assistant.\n\n"
+        "📊 <b>With SentriBot, you can:</b>\n"
+        "• Track member activity and engagement.\n"
+        "• Get alerts when members join or leave.\n"
+        "• Monitor keywords and detect mood changes in chats.\n"
+        "• Watch for mentions of your token or ticker on X.\n"
+        "• Receive blockchain whale and wallet activity alerts.\n"
+        "• Get notified when someone follows your X account.\n\n"
+        "🔒 <b>You control all data.</b> SentriBot is private and built for your project.",
+        parse_mode="HTML"
+    )
+
+# -------- ADMIN COMMANDS --------
+async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ Group: deep-link to DM; DM: handled via /start payload + PENDING_WELCOME_DM """
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type in ("group", "supergroup"):
+        # Admin gate
+        if not await _is_admin(context, chat.id, user.id):
+            await update.message.reply_text("❌ Only admins can set the welcome message.")
+            return
+        deep = f"https://t.me/sentrip_bot?start=cfg_welcome_{chat.id}"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Open in DM to set welcome", url=deep)]])
+        await update.message.reply_text(
+            "Open me in a private chat to set the welcome message for this group.",
+            reply_markup=kb
+        )
+        return
+
+    # If someone types /setwelcome in DM without payload, guide them
+    await update.message.reply_text("Use the buttons above or /start and pick a group to configure.")
+
+async def set_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ Group: deep-link to DM; DM: handled via /start payload + PENDING_RULES_DM """
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type in ("group", "supergroup"):
+        if not await _is_admin(context, chat.id, user.id):
+            await update.message.reply_text("❌ Only admins can set /rules.")
+            return
+        deep = f"https://t.me/sentrip_bot?start=cfg_rules_{chat.id}"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("💬 Open in DM to set /rules", url=deep)]])
+        await update.message.reply_text(
+            "Open me in a private chat to set the /rules text for this group.",
+            reply_markup=kb
+        )
+        return
+    await update.message.reply_text("Use the buttons above or /start and pick a group to configure.")
+
+async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message:
+        await update.message.reply_text("❌ Reply to a user's message to warn them.")
+        return
+
+    user = update.message.reply_to_message.from_user
+    uid = user.id
+    warnings[uid] = warnings.get(uid, 0) + 1
+    await update.message.reply_text(f"⚠ {user.first_name} has been warned! ({warnings[uid]}/{warn_limit})")
+    if warnings[uid] >= warn_limit:
+        await update.message.chat.ban_member(uid)
+        await update.message.reply_text(f"🚫 {user.first_name} was banned after too many warnings.")
+
+async def pin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.reply_to_message:
+        await update.message.reply_to_message.pin()
+        await update.message.reply_text("📌 Message pinned!")
+    else:
+        await update.message.reply_text("❌ Reply to a message to pin it.")
+
+# -------- AUTO FEATURES (message-based) --------
+async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    message_template = welcome_messages.get(chat_id, DEFAULT_WELCOME)
+
+    for member in update.message.new_chat_members:
+        if member.is_bot:
+            await update.message.chat.ban_member(member.id)
+            await update.message.reply_text(f"🤖 Bot {member.first_name} was removed.")
+            return
+        await update.message.reply_text(
+            message_template.format(name=member.mention_html()),
+            parse_mode="HTML"
+        )
+        await log_activity(f"User joined: {member.full_name}")
+
+async def goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.left_chat_member:
+        await update.message.reply_text(f"👋 Goodbye {update.message.left_chat_member.full_name}!")
+        await log_activity(f"User left: {update.message.left_chat_member.full_name}")
+
+# -------- ChatMember updates (users) --------
+def _status_change(old, new):
+    try:
+        return (old.status != new.status) or (old.is_member != new.is_member)
+    except Exception:
+        return True
+
+async def user_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cmu = update.chat_member
+    if not cmu:
+        return
+    old, new = cmu.old_chat_member, cmu.new_chat_member
+    if not _status_change(old, new):
+        return
+
+    joined = (not getattr(old, "is_member", False) and getattr(new, "is_member", False)) or (
+        old.status in ("left", "kicked") and new.status in ("member", "administrator", "creator")
+    )
+    left = (getattr(old, "is_member", False) and not getattr(new, "is_member", False)) or (
+        new.status in ("left", "kicked")
+    )
+
+    if joined:
+        chat_id = cmu.chat.id
+        _remember_chat(chat_id, cmu.chat.title or str(chat_id))
+
+        message_template = welcome_messages.get(chat_id, DEFAULT_WELCOME)
+        user = cmu.from_user
+        if user.is_bot:
+            await context.bot.ban_chat_member(cmu.chat.id, user.id)
+            await context.bot.send_message(cmu.chat.id, f"🤖 Bot {user.first_name} was removed.")
+        else:
+            await context.bot.send_message(
+                cmu.chat.id,
+                message_template.format(name=user.mention_html()),
+                parse_mode="HTML",
+            )
+            await log_activity(f"User joined: {user.full_name}")
+
+    elif left:
+        user = cmu.from_user
+        await context.bot.send_message(cmu.chat.id, f"👋 Goodbye {user.full_name}!")
+        await log_activity(f"User left: {user.full_name}")
+
+# -------- My Chat Member updates (bot itself added/removed) --------
+async def my_bot_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    When the bot is added to a group/supergroup, remember the chat and send success message
+    with a 'Continue' button that opens the help menu.
+    """
+    mcu = update.my_chat_member
+    if not mcu:
+        return
+
+    old, new = mcu.old_chat_member, mcu.new_chat_member
+    became_member = new.status in ("member", "administrator")
+    was_outside = old.status in ("left", "kicked") or not getattr(old, "is_member", False)
+
+    chat = mcu.chat
+    if chat:
+        _remember_chat(chat.id, chat.title or str(chat.id))
+
+    if became_member and was_outside:
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("➡️ Continue", callback_data="help:menu")]]
+        )
+        await context.bot.send_message(
+            chat_id=mcu.chat.id,
+            text="✅ <b>SentriBot added to the group successfully!</b>\n\nTap <b>Continue</b> to open the help menu and see everything I can do.",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+
+# -------- FILTERS (group triggers) --------
+async def cmd_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Use /filter inside a group.")
+        return
+    if not await _is_admin(context, chat.id, user.id):
+        await update.message.reply_text("❌ Only admins can set filters.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: <code>/filter &lt;trigger&gt;</code>", parse_mode="HTML")
+        return
+    trigger = " ".join(context.args).strip().lower()
+    if not trigger:
+        await update.message.reply_text("Trigger cannot be empty.")
+        return
+    PENDING_FILTER_REPLY[chat.id] = {"trigger": trigger, "user_id": user.id}
+    await update.message.reply_text(
+        f"✏️ Send the reply text for trigger <b>{trigger}</b> now.",
+        parse_mode="HTML"
+    )
+
+async def cmd_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Use /filters inside a group.")
+        return
+    fmap = filters_map.get(chat.id, {})
+    if not fmap:
+        await update.message.reply_text("📭 No filters set in this group.")
+        return
+    lines = [f"• <code>{k}</code>" for k in sorted(fmap.keys())]
+    await update.message.reply_text("🗂 <b>Filters</b>\n" + "\n".join(lines), parse_mode="HTML")
+
+async def cmd_delfilter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Use /delfilter inside a group.")
+        return
+    if not await _is_admin(context, chat.id, user.id):
+        await update.message.reply_text("❌ Only admins can delete filters.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: <code>/delfilter &lt;trigger&gt;</code>", parse_mode="HTML")
+        return
+    trigger = " ".join(context.args).strip().lower()
+    fmap = filters_map.setdefault(chat.id, {})
+    if trigger in fmap:
+        del fmap[trigger]
+        _save_json(PATH_FILTERS, {str(k): v for k, v in filters_map.items()})
+        await update.message.reply_text(f"🗑 Removed filter <b>{trigger}</b>.", parse_mode="HTML")
+    else:
+        await update.message.reply_text("Not found.")
+
+async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ Handle pending filter replies and trigger matches """
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    # 1) Is this a pending filter reply?
+    pending = PENDING_FILTER_REPLY.get(chat.id)
+    if pending and pending.get("user_id") == update.effective_user.id:
+        trigger = pending["trigger"]
+        reply = msg.text
+        fmap = filters_map.setdefault(chat.id, {})
+        fmap[trigger] = reply
+        _save_json(PATH_FILTERS, {str(k): v for k, v in filters_map.items()})
+        del PENDING_FILTER_REPLY[chat.id]
+        await msg.reply_text(f"✅ Saved filter for <b>{trigger}</b>.", parse_mode="HTML")
+        return
+
+    # 2) Trigger match: exact match (case-insensitive, trimmed)
+    text = msg.text.strip().lower()
+    fmap = filters_map.get(chat.id, {})
+    if text in fmap:
+        await msg.reply_text(fmap[text], disable_web_page_preview=True)
+
+# -------- DM text capture for welcome/rules flows --------
+async def handle_dm_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type != "private":
+        return
+
+    # Welcome flow
+    target_chat = PENDING_WELCOME_DM.get(user.id)
+    if target_chat:
+        text = msg.text.strip()
+        # Force tag first
+        final = "{name} " + text
+        welcome_messages[target_chat] = final
+        _save_json(PATH_WELCOME, {str(k): v for k, v in welcome_messages.items()})
+        title = known_chats.get(target_chat, str(target_chat))
+        del PENDING_WELCOME_DM[user.id]
+        await msg.reply_text(
+            f"✅ Welcome message set for <b>{title}</b>.",
+            parse_mode="HTML"
+        )
+        return
+
+    # Rules flow
+    target_rules = PENDING_RULES_DM.get(user.id)
+    if target_rules:
+        text = msg.text.strip()
+        rules_texts[target_rules] = text
+        _save_json(PATH_RULES, {str(k): v for k, v in rules_texts.items()})
+        title = known_chats.get(target_rules, str(target_rules))
+        del PENDING_RULES_DM[user.id]
+        await msg.reply_text(
+            f"✅ /rules updated for <b>{title}</b>.",
+            parse_mode="HTML"
+        )
+        return
+
+# -------- Config pick callbacks (from DM buttons) --------
+async def cfgpick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    # format: cfgpick:<type>:<chat_id>
+    try:
+        _, kind, cid = data.split(":", 2)
+        cid = int(cid)
+    except Exception:
+        return
+    title = known_chats.get(cid, str(cid))
+    if kind == "welcome":
+        PENDING_WELCOME_DM[q.from_user.id] = cid
+        await q.message.reply_text(
+            f"✏️ Send the <b>new welcome message</b> for <b>{title}</b> now.\n\n"
+            "Note: I will always tag the new member first.",
+            parse_mode="HTML"
+        )
+    elif kind == "rules":
+        PENDING_RULES_DM[q.from_user.id] = cid
+        await q.message.reply_text(
+            f"✏️ Send the <b>new /rules text</b> for <b>{title}</b> now.",
+            parse_mode="HTML"
+        )
+
+# -------- SPAM DETECTION --------
+SPAM_KEYWORDS = os.getenv("SPAM_KEYWORDS", "")
+SPAM_KEYWORDS = [word.strip().lower() for word in SPAM_KEYWORDS.split(",") if word.strip()]
+
+async def detect_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message and update.message.text and any(
+        word in update.message.text.lower() for word in SPAM_KEYWORDS
+    ):
+        user_name = update.message.from_user.first_name
+        chat_id = update.effective_chat.id
+        msg_id = update.message.message_id
+
+        # Delete the spam message
+        await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+
+        # Notify the group
+        await context.bot.send_message(chat_id=chat_id, text=f"🚫 Spam detected from {user_name}")
+
+        # Warn the user
+        await warn_user(update, context)
+
+# -------- LOGGING --------
+async def log_activity(text):
+    with open("activity.log", "a", encoding="utf-8") as f:
+        f.write(f"[{datetime.now()}] {text}\n")
+
+# -------- REGISTRATION (called from main.py) --------
+def register_moderation(app):
+    # Commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("continue", continue_cmd))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("rules", rules))
+    app.add_handler(CommandHandler("about", about))
+
+    # New editable commands
+    app.add_handler(CommandHandler("setwelcome", set_welcome))
+    app.add_handler(CommandHandler("setrules", set_rules))
+
+    # Filters commands
+    app.add_handler(CommandHandler("filter", cmd_filter))
+    app.add_handler(CommandHandler("filters", cmd_filters))
+    app.add_handler(CommandHandler("delfilter", cmd_delfilter))
+
+    # Moderation commands
+    app.add_handler(CommandHandler("warn", warn_user))
+    app.add_handler(CommandHandler("pin", pin_message))
+
+    # DM config pick buttons
+    app.add_handler(CallbackQueryHandler(cfgpick_cb, pattern=r"^cfgpick:(welcome|rules):\d+$"))
+
+    # Help menu callbacks
+    app.add_handler(CallbackQueryHandler(help_menu_cb, pattern=r"^help:"))
+
+    # Auto actions (message-based)
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
+    app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, goodbye))
+
+    # Group text handler (filters & interactive replies) BEFORE spam detection
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_group_text))
+
+    # Spam detection
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, detect_spam))
+
+    # User membership updates (joins/leaves delivered as ChatMember updates)
+    app.add_handler(ChatMemberHandler(user_member_update, ChatMemberHandler.CHAT_MEMBER))
+
+    # Bot's own membership updates (added to a group)
+    app.add_handler(ChatMemberHandler(my_bot_member_update, ChatMemberHandler.MY_CHAT_MEMBER))
+
+    # DM text capture (for welcome/rules)
+    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, handle_dm_text))
